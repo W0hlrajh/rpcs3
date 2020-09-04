@@ -225,7 +225,7 @@ void main_window::Init()
 		m_updater.check_for_updates(true, update_value != "true", this);
 	}
 #endif
-*/
+
 }
 
 QString main_window::GetCurrentTitle()
