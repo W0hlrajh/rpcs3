@@ -99,6 +99,7 @@ private:
 	std::unique_ptr<gl::ring_buffer> m_index_ring_buffer;
 	std::unique_ptr<gl::ring_buffer> m_vertex_instructions_buffer;
 	std::unique_ptr<gl::ring_buffer> m_fragment_instructions_buffer;
+	std::unique_ptr<gl::ring_buffer> m_raster_env_ring_buffer;
 
 	// Identity buffer used to fix broken gl_VertexID on ATI stack
 	std::unique_ptr<gl::buffer> m_identity_index_buffer;
@@ -113,7 +114,6 @@ private:
 	bool manually_flush_ring_buffers = false;
 
 	gl::text_writer m_text_printer;
-	gl::depth_convert_pass m_depth_converter;
 	gl::ui_overlay_renderer m_ui_renderer;
 	gl::video_out_calibration_pass m_video_output_pass;
 

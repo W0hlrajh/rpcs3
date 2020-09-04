@@ -36,6 +36,11 @@ enum class ppu_syscall_code : u64
 {
 };
 
+enum : u32
+{
+	ppu_stack_start_offset = 0x70,
+};
+
 // ppu function descriptor
 struct ppu_func_opd_t
 {
@@ -60,11 +65,12 @@ public:
 	static const u32 id_base = 0x01000000; // TODO (used to determine thread type)
 	static const u32 id_step = 1;
 	static const u32 id_count = 2048;
+	static constexpr std::pair<u32, u32> id_invl_range = {12, 12};
 
 	virtual std::string dump_all() const override;
 	virtual std::string dump_regs() const override;
 	virtual std::string dump_callstack() const override;
-	virtual std::vector<u32> dump_callstack_list() const override;
+	virtual std::vector<std::pair<u32, u32>> dump_callstack_list() const override;
 	virtual std::string dump_misc() const override;
 	virtual void cpu_task() override final;
 	virtual void cpu_sleep() override;
@@ -180,7 +186,10 @@ public:
 			exception, the corresponding element in the target vr is cleared to '0'. In both cases, the '0'
 			has the same sign as the denormalized or underflowing value.
 	*/
-	bool nj = false;
+	bool nj = true;
+
+	// Optimization: precomputed java-mode mask for handling denormals
+	u32 jm_mask = 0x7f80'0000;
 
 	u32 raddr{0}; // Reservation addr
 	u64 rtime{0};

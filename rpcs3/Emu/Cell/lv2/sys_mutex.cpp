@@ -13,7 +13,7 @@ template<> DECLARE(ipc_manager<lv2_mutex, u64>::g_ipc) {};
 
 error_code sys_mutex_create(ppu_thread& ppu, vm::ptr<u32> mutex_id, vm::ptr<sys_mutex_attribute_t> attr)
 {
-	vm::temporary_unlock(ppu);
+	ppu.state += cpu_flag::wait;
 
 	sys_mutex.warning("sys_mutex_create(mutex_id=*0x%x, attr=*0x%x)", mutex_id, attr);
 
@@ -75,7 +75,7 @@ error_code sys_mutex_create(ppu_thread& ppu, vm::ptr<u32> mutex_id, vm::ptr<sys_
 
 error_code sys_mutex_destroy(ppu_thread& ppu, u32 mutex_id)
 {
-	vm::temporary_unlock(ppu);
+	ppu.state += cpu_flag::wait;
 
 	sys_mutex.warning("sys_mutex_destroy(mutex_id=0x%x)", mutex_id);
 
@@ -88,7 +88,17 @@ error_code sys_mutex_destroy(ppu_thread& ppu, u32 mutex_id)
 			return CELL_EBUSY;
 		}
 
-		if (mutex.cond_count)
+		if (!mutex.obj_count.fetch_op([](typename lv2_mutex::count_info& info)
+		{
+			if (info.cond_count)
+			{
+				return false;
+			}
+
+			// Decrement mutex copies count
+			info.mutex_count--;
+			return true;
+		}).second)
 		{
 			return CELL_EPERM;
 		}
@@ -111,7 +121,7 @@ error_code sys_mutex_destroy(ppu_thread& ppu, u32 mutex_id)
 
 error_code sys_mutex_lock(ppu_thread& ppu, u32 mutex_id, u64 timeout)
 {
-	vm::temporary_unlock(ppu);
+	ppu.state += cpu_flag::wait;
 
 	sys_mutex.trace("sys_mutex_lock(mutex_id=0x%x, timeout=0x%llx)", mutex_id, timeout);
 
@@ -194,7 +204,7 @@ error_code sys_mutex_lock(ppu_thread& ppu, u32 mutex_id, u64 timeout)
 
 error_code sys_mutex_trylock(ppu_thread& ppu, u32 mutex_id)
 {
-	vm::temporary_unlock(ppu);
+	ppu.state += cpu_flag::wait;
 
 	sys_mutex.trace("sys_mutex_trylock(mutex_id=0x%x)", mutex_id);
 
@@ -223,7 +233,7 @@ error_code sys_mutex_trylock(ppu_thread& ppu, u32 mutex_id)
 
 error_code sys_mutex_unlock(ppu_thread& ppu, u32 mutex_id)
 {
-	vm::temporary_unlock(ppu);
+	ppu.state += cpu_flag::wait;
 
 	sys_mutex.trace("sys_mutex_unlock(mutex_id=0x%x)", mutex_id);
 

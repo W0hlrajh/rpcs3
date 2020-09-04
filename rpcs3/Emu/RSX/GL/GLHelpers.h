@@ -28,9 +28,10 @@
 #define GL_FRAGMENT_CONSTANT_BUFFERS_BIND_SLOT 3
 #define GL_FRAGMENT_STATE_BIND_SLOT 4
 #define GL_FRAGMENT_TEXTURE_PARAMS_BIND_SLOT 5
-#define GL_INTERPRETER_VERTEX_BLOCK 6
-#define GL_INTERPRETER_FRAGMENT_BLOCK 7
-#define GL_COMPUTE_BUFFER_SLOT(index) (index + 8)
+#define GL_RASTERIZER_STATE_BIND_SLOT 6
+#define GL_INTERPRETER_VERTEX_BLOCK 7
+#define GL_INTERPRETER_FRAGMENT_BLOCK 8
+#define GL_COMPUTE_BUFFER_SLOT(index) (index + 9)
 
 // Noop keyword outside of Windows (used in log_debug)
 #if !defined(_WIN32) && !defined(APIENTRY)
@@ -38,6 +39,9 @@
 #endif
 
 inline static void _SelectTexture(int unit) { glActiveTexture(GL_TEXTURE0 + unit); }
+
+//using enum rsx::format_class;
+using namespace ::rsx::format_class_;
 
 namespace gl
 {
@@ -1472,11 +1476,9 @@ namespace gl
 			bgr = GL_BGR,
 			bgra = GL_BGRA,
 
-			stencil = GL_STENCIL_INDEX,
 			stencil8 = GL_STENCIL_INDEX8,
-			depth = GL_DEPTH_COMPONENT,
 			depth16 = GL_DEPTH_COMPONENT16,
-			depth_stencil = GL_DEPTH_STENCIL,
+			depth32f = GL_DEPTH_COMPONENT32F,
 			depth24_stencil8 = GL_DEPTH24_STENCIL8,
 			depth32f_stencil8 = GL_DEPTH32F_STENCIL8,
 
@@ -1517,18 +1519,6 @@ namespace gl
 			ref_to_texture = GL_COMPARE_REF_TO_TEXTURE
 		};
 
-		enum class compare_func
-		{
-			never = GL_NEVER,
-			less = GL_LESS,
-			equal = GL_EQUAL,
-			lequal = GL_LEQUAL,
-			greater = GL_GREATER,
-			notequal = GL_NOTEQUAL,
-			gequal = GL_GEQUAL,
-			always = GL_ALWAYS
-		};
-
 		enum class target
 		{
 			texture1D = GL_TEXTURE_1D,
@@ -1536,25 +1526,6 @@ namespace gl
 			texture3D = GL_TEXTURE_3D,
 			textureCUBE = GL_TEXTURE_CUBE_MAP,
 			textureBuffer = GL_TEXTURE_BUFFER
-		};
-
-		enum class channel_type
-		{
-			none = GL_NONE,
-			signed_normalized = GL_SIGNED_NORMALIZED,
-			unsigned_normalized = GL_UNSIGNED_NORMALIZED,
-			float_ = GL_FLOAT,
-			int_ = GL_INT,
-			uint_ = GL_UNSIGNED_INT
-		};
-
-		enum class channel_name
-		{
-			red = GL_TEXTURE_RED_TYPE,
-			green = GL_TEXTURE_GREEN_TYPE,
-			blue = GL_TEXTURE_BLUE_TYPE,
-			alpha = GL_TEXTURE_ALPHA_TYPE,
-			depth = GL_TEXTURE_DEPTH_TYPE
 		};
 
 	protected:
@@ -1570,6 +1541,8 @@ namespace gl
 		target m_target = target::texture2D;
 		internal_format m_internal_format = internal_format::rgba8;
 		std::array<GLenum, 4> m_component_layout;
+
+		rsx::format_class m_format_class = RSX_FORMAT_CLASS_UNDEFINED;
 
 	private:
 		class save_binding_state
@@ -1613,7 +1586,8 @@ namespace gl
 		texture(const texture&) = delete;
 		texture(texture&& texture_) = delete;
 
-		texture(GLenum target, GLuint width, GLuint height, GLuint depth, GLuint mipmaps, GLenum sized_format)
+		texture(GLenum target, GLuint width, GLuint height, GLuint depth, GLuint mipmaps, GLenum sized_format,
+				rsx::format_class format_class = rsx::RSX_FORMAT_CLASS_UNDEFINED)
 		{
 			save_binding_state save(target);
 			glGenTextures(1, &m_id);
@@ -1706,9 +1680,22 @@ namespace gl
 				}
 			}
 
+			if (format_class == RSX_FORMAT_CLASS_UNDEFINED)
+			{
+				if (m_aspect_flags != image_aspect::color)
+				{
+					rsx_log.error("Undefined format class for depth texture is not allowed");
+				}
+				else
+				{
+					format_class = RSX_FORMAT_CLASS_COLOR;
+				}
+			}
+
 			m_target = static_cast<texture::target>(target);
 			m_internal_format = static_cast<internal_format>(sized_format);
 			m_component_layout = { GL_ALPHA, GL_RED, GL_GREEN, GL_BLUE };
+			m_format_class = format_class;
 		}
 
 		virtual ~texture()
@@ -1790,6 +1777,11 @@ namespace gl
 		GLuint aspect() const
 		{
 			return m_aspect_flags;
+		}
+
+		rsx::format_class format_class() const
+		{
+			return m_format_class;
 		}
 
 		sizeu size2D() const
@@ -2465,7 +2457,7 @@ public:
 				if (g_cfg.video.log_programs)
 				{
 					std::string base_name;
-					switch (shader_type)
+					switch (type)
 					{
 					case ::glsl::program_domain::glsl_vertex_program:
 						base_name = "shaderlog/VertexProgram";
@@ -2711,7 +2703,7 @@ public:
 				glUseProgram(m_id);
 			}
 
-			void link()
+			void link(std::function<void(program*)> init_func = {})
 			{
 				glLinkProgram(m_id);
 
@@ -2735,6 +2727,11 @@ public:
 				}
 				else
 				{
+					if (init_func)
+					{
+						init_func(this);
+					}
+
 					m_fence.create();
 
 					if (!is_primary_context_thread())

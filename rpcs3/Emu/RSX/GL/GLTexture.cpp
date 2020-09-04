@@ -1,6 +1,7 @@
 ﻿#include "stdafx.h"
 #include "GLTexture.h"
 #include "GLCompute.h"
+#include "GLRenderTargets.h"
 #include "../GCM.h"
 #include "../RSXThread.h"
 #include "../RSXTexture.h"
@@ -33,9 +34,9 @@ namespace gl
 		case CELL_GCM_TEXTURE_G8B8: return GL_RG8;
 		case CELL_GCM_TEXTURE_R6G5B5: return GL_RGB565;
 		case CELL_GCM_TEXTURE_DEPTH24_D8: return GL_DEPTH24_STENCIL8;
-		case CELL_GCM_TEXTURE_DEPTH24_D8_FLOAT: return GL_DEPTH_COMPONENT32;
+		case CELL_GCM_TEXTURE_DEPTH24_D8_FLOAT: return GL_DEPTH32F_STENCIL8;
 		case CELL_GCM_TEXTURE_DEPTH16: return GL_DEPTH_COMPONENT16;
-		case CELL_GCM_TEXTURE_DEPTH16_FLOAT: return GL_DEPTH_COMPONENT16;
+		case CELL_GCM_TEXTURE_DEPTH16_FLOAT: return GL_DEPTH_COMPONENT32F;
 		case CELL_GCM_TEXTURE_X16: return GL_R16;
 		case CELL_GCM_TEXTURE_Y16_X16: return GL_RG16;
 		case CELL_GCM_TEXTURE_R5G5B5A1: return GL_RGB5_A1;
@@ -68,8 +69,8 @@ namespace gl
 		case CELL_GCM_TEXTURE_G8B8: return std::make_tuple(GL_RG, GL_UNSIGNED_BYTE);
 		case CELL_GCM_TEXTURE_R6G5B5: return std::make_tuple(GL_RGB, GL_UNSIGNED_SHORT_5_6_5);
 		case CELL_GCM_TEXTURE_DEPTH24_D8: return std::make_tuple(GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8);
-		case CELL_GCM_TEXTURE_DEPTH24_D8_FLOAT: return std::make_tuple(GL_DEPTH_COMPONENT, GL_FLOAT);
-		case CELL_GCM_TEXTURE_DEPTH16: return std::make_tuple(GL_DEPTH_COMPONENT, GL_SHORT);
+		case CELL_GCM_TEXTURE_DEPTH24_D8_FLOAT: return std::make_tuple(GL_DEPTH_STENCIL, GL_FLOAT); // TODO, requires separate aspect readback
+		case CELL_GCM_TEXTURE_DEPTH16: return std::make_tuple(GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT);
 		case CELL_GCM_TEXTURE_DEPTH16_FLOAT: return std::make_tuple(GL_DEPTH_COMPONENT, GL_HALF_FLOAT);
 		case CELL_GCM_TEXTURE_X16: return std::make_tuple(GL_RED, GL_UNSIGNED_SHORT);
 		case CELL_GCM_TEXTURE_Y16_X16: return std::make_tuple(GL_RG, GL_UNSIGNED_SHORT);
@@ -106,7 +107,7 @@ namespace gl
 		case texture::internal_format::r32f:
 			return { GL_RED, GL_FLOAT, 4, true };
 		case texture::internal_format::rg8:
-			return { GL_RG, GL_UNSIGNED_BYTE, 1, false };
+			return { GL_RG, GL_UNSIGNED_SHORT, 2, true };
 		case texture::internal_format::rg16:
 			return { GL_RG, GL_UNSIGNED_SHORT, 2, true };
 		case texture::internal_format::rg16f:
@@ -131,6 +132,29 @@ namespace gl
 		default:
 			fmt::throw_exception("Unexpected internal format 0x%X" HERE, static_cast<u32>(format));
 		}
+	}
+
+	pixel_buffer_layout get_format_type(const gl::texture* tex)
+	{
+		const auto ifmt = tex->get_internal_format();
+		if (ifmt == gl::texture::internal_format::rgba8)
+		{
+			// Multiple RTT layouts can map to this format. Override ABGR formats
+			if (auto rtt = dynamic_cast<const gl::render_target*>(tex))
+			{
+				switch (rtt->format_info.gcm_color_format)
+				{
+				case rsx::surface_color_format::x8b8g8r8_z8b8g8r8:
+				case rsx::surface_color_format::x8b8g8r8_o8b8g8r8:
+				case rsx::surface_color_format::a8b8g8r8:
+					return { GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, 4, false };
+				default:
+					break;
+				}
+			}
+		}
+
+		return get_format_type(ifmt);
 	}
 
 	GLenum get_srgb_format(GLenum in_format)
@@ -456,9 +480,9 @@ namespace gl
 	}
 
 	void fill_texture(rsx::texture_dimension_extended dim, u16 mipmap_count, int format, u16 width, u16 height, u16 depth,
-			const std::vector<rsx_subresource_layout> &input_layouts, bool is_swizzled, GLenum gl_format, GLenum gl_type, std::vector<std::byte>& staging_buffer)
+			const std::vector<rsx::subresource_layout> &input_layouts, bool is_swizzled, GLenum gl_format, GLenum gl_type, std::vector<std::byte>& staging_buffer)
 	{
-		texture_uploader_capabilities caps{ true, false, false, 4 };
+		rsx::texture_uploader_capabilities caps{ true, false, false, 4 };
 
 		pixel_unpack_settings unpack_settings;
 		unpack_settings.row_length(0).alignment(4);
@@ -472,7 +496,7 @@ namespace gl
 
 			const GLsizei format_block_size = (format == CELL_GCM_TEXTURE_COMPRESSED_DXT1) ? 8 : 16;
 
-			for (const rsx_subresource_layout& layout : input_layouts)
+			for (const rsx::subresource_layout& layout : input_layouts)
 			{
 				upload_texture_subresource(staging_buffer, layout, format, is_swizzled, caps);
 				const sizei image_size{ align(layout.width_in_texel, 4), align(layout.height_in_texel, 4) };
@@ -537,7 +561,7 @@ namespace gl
 				unpack_settings.apply();
 			}
 
-			for (const rsx_subresource_layout& layout : input_layouts)
+			for (const rsx::subresource_layout& layout : input_layouts)
 			{
 				auto op = upload_texture_subresource(staging_buffer, layout, format, is_swizzled, caps);
 				if (apply_settings)
@@ -603,7 +627,7 @@ namespace gl
 	}
 
 	void upload_texture(GLuint id, u32 gcm_format, u16 width, u16 height, u16 depth, u16 mipmaps, bool is_swizzled, rsx::texture_dimension_extended type,
-			const std::vector<rsx_subresource_layout>& subresources_layout)
+			const std::vector<rsx::subresource_layout>& subresources_layout)
 	{
 		GLenum target;
 		switch (type)
@@ -628,7 +652,7 @@ namespace gl
 		// The rest of sampler state is now handled by sampler state objects
 
 		// Calculate staging buffer size
-		const u32 aligned_pitch = align<u32>(width * get_format_block_size_in_bytes(gcm_format), 4);
+		const u32 aligned_pitch = align<u32>(width * rsx::get_format_block_size_in_bytes(gcm_format), 4);
 		size_t texture_data_sz = depth * height * aligned_pitch;
 		std::vector<std::byte> data_upload_buf(texture_data_sz);
 
@@ -780,8 +804,8 @@ namespace gl
 		}
 
 		const auto& caps = gl::get_driver_caps();
-		const auto pack_info = get_format_type(src->get_internal_format());
-		const auto unpack_info = get_format_type(dst->get_internal_format());
+		auto pack_info = get_format_type(src);
+		auto unpack_info = get_format_type(dst);
 
 		// Start pack operation
 		g_typeless_transfer_buffer.bind(buffer::target::pixel_pack);

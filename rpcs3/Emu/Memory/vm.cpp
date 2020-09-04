@@ -69,6 +69,38 @@ namespace vm
 	std::array<atomic_t<cpu_thread*>, g_cfg.core.ppu_threads.max> g_locks{};
 	std::array<atomic_t<u64>, 6> g_range_locks{};
 
+	// Page information
+	struct memory_page
+	{
+		// Memory flags
+		atomic_t<u8> flags;
+	};
+
+	// Memory pages
+	std::array<memory_page, 0x100000000 / 4096> g_pages{};
+
+	void reservation_update(u32 addr, u32 size, bool lsb)
+	{
+		u64 old = UINT64_MAX;
+		const auto cpu = get_current_cpu_thread();
+
+		while (true)
+		{
+			const auto [ok, rtime] = try_reservation_update(addr, size, lsb);
+			if (ok || old / 128 < rtime / 128)
+			{
+				return;
+			}
+
+			old = rtime;
+
+			if (cpu && cpu->test_stopped())
+			{
+				return;
+			}
+		}
+	}
+
 	static void _register_lock(cpu_thread* _cpu)
 	{
 		for (u32 i = 0, max = g_cfg.core.ppu_threads;;)
@@ -76,7 +108,7 @@ namespace vm
 			if (!g_locks[i] && g_locks[i].compare_and_swap_test(nullptr, _cpu))
 			{
 				g_tls_locked = g_locks.data() + i;
-				return;
+				break;
 			}
 
 			if (++i == max) i = 0;
@@ -127,47 +159,38 @@ namespace vm
 
 	void passive_lock(cpu_thread& cpu)
 	{
-		if (g_tls_locked && *g_tls_locked == &cpu) [[unlikely]]
+		if (!g_tls_locked || *g_tls_locked != &cpu) [[unlikely]]
 		{
-			if (cpu.state & cpu_flag::wait)
-			{
-				while (true)
-				{
-					g_mutex.lock_unlock();
-					cpu.state -= cpu_flag::wait + cpu_flag::memory;
-
-					if (g_mutex.is_lockable()) [[likely]]
-					{
-						return;
-					}
-
-					cpu.state += cpu_flag::wait;
-				}
-			}
-
-			return;
-		}
-
-		if (cpu.state & cpu_flag::memory)
-		{
-			cpu.state -= cpu_flag::memory + cpu_flag::wait;
-		}
-
-		if (g_mutex.is_lockable()) [[likely]]
-		{
-			// Optimistic path (hope that mutex is not exclusively locked)
 			_register_lock(&cpu);
 
-			if (g_mutex.is_lockable()) [[likely]]
+			if (cpu.state) [[likely]]
+			{
+				cpu.state -= cpu_flag::wait + cpu_flag::memory;
+			}
+
+			if (g_mutex.is_lockable())
 			{
 				return;
 			}
 
-			passive_unlock(cpu);
+			cpu.state += cpu_flag::wait;
 		}
 
-		::reader_lock lock(g_mutex);
-		_register_lock(&cpu);
+		if (cpu.state & cpu_flag::wait)
+		{
+			while (true)
+			{
+				g_mutex.lock_unlock();
+				cpu.state -= cpu_flag::wait + cpu_flag::memory;
+
+				if (g_mutex.is_lockable()) [[likely]]
+				{
+					return;
+				}
+
+				cpu.state += cpu_flag::wait;
+			}
+		}
 	}
 
 	atomic_t<u64>* range_lock(u32 addr, u32 end)
@@ -215,14 +238,12 @@ namespace vm
 			return 0;
 		};
 
-		atomic_t<u64>* _ret;
-
 		if (u64 _a1 = test_addr(g_addr_lock.load(), addr, end)) [[likely]]
 		{
 			// Optimistic path (hope that address range is not locked)
-			_ret = _register_range_lock(_a1);
+			const auto _ret = _register_range_lock(_a1);
 
-			if (_a1 == test_addr(g_addr_lock.load(), addr, end)) [[likely]]
+			if (_a1 == test_addr(g_addr_lock.load(), addr, end) && !!(g_pages[addr / 4096].flags & page_readable)) [[likely]]
 			{
 				return _ret;
 			}
@@ -230,12 +251,22 @@ namespace vm
 			*_ret = 0;
 		}
 
+		while (true)
 		{
-			::reader_lock lock(g_mutex);
-			_ret = _register_range_lock(test_addr(UINT32_MAX, addr, end));
-		}
+			std::shared_lock lock(g_mutex);
 
-		return _ret;
+			if (!(g_pages[addr / 4096].flags & page_readable))
+			{
+				lock.unlock();
+
+				// Try tiggering a page fault (write)
+				// TODO: Read memory if needed
+				vm::_ref<atomic_t<u8>>(addr) += 0;
+				continue;
+			}
+
+			return _register_range_lock(test_addr(UINT32_MAX, addr, end));
+		}
 	}
 
 	void passive_unlock(cpu_thread& cpu)
@@ -266,7 +297,7 @@ namespace vm
 
 	void temporary_unlock(cpu_thread& cpu) noexcept
 	{
-		cpu.state += cpu_flag::wait;
+		if (!(cpu.state & cpu_flag::wait)) cpu.state += cpu_flag::wait;
 
 		if (g_tls_locked && g_tls_locked->compare_and_swap_test(&cpu, nullptr))
 		{
@@ -286,17 +317,23 @@ namespace vm
 	{
 		auto cpu = get_current_cpu_thread();
 
-		if (!cpu || !g_tls_locked || !g_tls_locked->compare_and_swap_test(cpu, nullptr))
+		if (cpu)
 		{
-			cpu = nullptr;
+			if (!g_tls_locked || *g_tls_locked != cpu)
+			{
+				cpu = nullptr;
+			}
+			else
+			{
+				cpu->state += cpu_flag::wait;
+			}
 		}
 
 		g_mutex.lock_shared();
 
 		if (cpu)
 		{
-			_register_lock(cpu);
-			cpu->state -= cpu_flag::memory;
+			cpu->state -= cpu_flag::memory + cpu_flag::wait;
 		}
 	}
 
@@ -327,9 +364,16 @@ namespace vm
 	{
 		auto cpu = get_current_cpu_thread();
 
-		if (!cpu || !g_tls_locked || !g_tls_locked->compare_and_swap_test(cpu, nullptr))
+		if (cpu)
 		{
-			cpu = nullptr;
+			if (!g_tls_locked || *g_tls_locked != cpu)
+			{
+				cpu = nullptr;
+			}
+			else
+			{
+				cpu->state += cpu_flag::wait;
+			}
 		}
 
 		g_mutex.lock();
@@ -338,7 +382,7 @@ namespace vm
 		{
 			for (auto lock = g_locks.cbegin(), end = lock + g_cfg.core.ppu_threads; lock != end; lock++)
 			{
-				if (cpu_thread* ptr = *lock)
+				if (auto ptr = +*lock; ptr && !(ptr->state & cpu_flag::memory))
 				{
 					ptr->state.test_and_set(cpu_flag::memory);
 				}
@@ -376,18 +420,17 @@ namespace vm
 
 			for (auto lock = g_locks.cbegin(), end = lock + g_cfg.core.ppu_threads; lock != end; lock++)
 			{
-				cpu_thread* ptr;
-				while ((ptr = *lock) && !(ptr->state & cpu_flag::wait))
+				if (auto ptr = +*lock)
 				{
-					_mm_pause();
+					while (!(ptr->state & cpu_flag::wait))
+						_mm_pause();
 				}
 			}
 		}
 
 		if (cpu)
 		{
-			_register_lock(cpu);
-			cpu->state -= cpu_flag::memory;
+			cpu->state -= cpu_flag::memory + cpu_flag::wait;
 		}
 	}
 
@@ -397,35 +440,35 @@ namespace vm
 		g_mutex.unlock();
 	}
 
-	void reservation_lock_internal(atomic_t<u64>& res)
+	u64 reservation_lock_internal(u32 addr, atomic_t<u64>& res, u64 lock_bits)
 	{
 		for (u64 i = 0;; i++)
 		{
-			if (!res.bts(0)) [[likely]]
+			if (u64 rtime = res; !(rtime & 127) && reservation_trylock(res, rtime, lock_bits)) [[likely]]
 			{
-				break;
+				return rtime;
 			}
 
-			if (i < 15)
+			if (auto cpu = get_current_cpu_thread(); cpu && cpu->state)
+			{
+				cpu->check_state();
+			}
+			else if (i < 15)
 			{
 				busy_wait(500);
 			}
 			else
 			{
+				// TODO: Accurate locking in this case
+				if (!(g_pages[addr / 4096].flags & page_writable))
+				{
+					return -1;
+				}
+
 				std::this_thread::yield();
 			}
 		}
 	}
-
-	// Page information
-	struct memory_page
-	{
-		// Memory flags
-		atomic_t<u8> flags;
-	};
-
-	// Memory pages
-	std::array<memory_page, 0x100000000 / 4096> g_pages{};
 
 	static void _page_map(u32 addr, u8 flags, u32 size, utils::shm* shm)
 	{
@@ -1257,6 +1300,7 @@ namespace vm
 
 			std::memset(g_reservations, 0, sizeof(g_reservations));
 			std::memset(g_shareable, 0, sizeof(g_shareable));
+			std::memset(g_range_locks.data(), 0, sizeof(g_range_locks));
 		}
 	}
 

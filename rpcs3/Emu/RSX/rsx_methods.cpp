@@ -151,14 +151,14 @@ namespace rsx
 			// TODO: Check if possible to write on reservations
 			if (!g_use_rtm && rsx->label_addr >> 28 != addr >> 28) [[likely]]
 			{
-				res = &vm::reservation_lock(addr, 4);
+				res = &vm::reservation_lock(addr, 4).first;
 			}
 
 			vm::_ref<RsxSemaphore>(addr).val = arg;
 
 			if (res)
 			{
-				res->release(*res & -128);
+				res->release(*res + 127);
 			}
 
 			vm::reservation_notifier(addr, 4).notify_all();
@@ -720,10 +720,37 @@ namespace rsx
 			set_surface_dirty_bit(rsx, reg, arg);
 		}
 
-		void set_surface_options_dirty_bit(thread* rsx, u32, u32)
+		void set_surface_options_dirty_bit(thread* rsx, u32 reg, u32 arg)
 		{
-			if (rsx->m_framebuffer_state_contested)
-				rsx->m_rtts_dirty = true;
+			if (arg != method_registers.register_previous_value)
+			{
+				rsx->on_framebuffer_options_changed(reg);
+			}
+		}
+
+		void set_stencil_op(thread* rsx, u32 reg, u32 arg)
+		{
+			if (arg != method_registers.register_previous_value)
+			{
+				switch (arg)
+				{
+				case CELL_GCM_INVERT:
+				case CELL_GCM_KEEP:
+				case CELL_GCM_REPLACE:
+				case CELL_GCM_INCR:
+				case CELL_GCM_DECR:
+				case CELL_GCM_INCR_WRAP:
+				case CELL_GCM_DECR_WRAP:
+				case CELL_GCM_ZERO:
+					set_surface_options_dirty_bit(rsx, reg, arg);
+					break;
+
+				default:
+					// Ignored on RSX
+					method_registers.decode(reg, method_registers.register_previous_value);
+					break;
+				}
+			}
 		}
 
 		template <u32 RsxFlags>
@@ -798,6 +825,37 @@ namespace rsx
 					method_registers.decode(reg, method_registers.register_previous_value);
 					return;
 				}
+				}
+			}
+		}
+
+		void set_blend_factor(thread* rsx, u32 reg, u32 arg)
+		{
+			for (u32 i = 0; i < 32u; i += 16)
+			{
+				switch ((arg >> i) & 0xffff)
+				{
+				case CELL_GCM_ZERO:
+				case CELL_GCM_ONE:
+				case CELL_GCM_SRC_COLOR:
+				case CELL_GCM_ONE_MINUS_SRC_COLOR:
+				case CELL_GCM_SRC_ALPHA:
+				case CELL_GCM_ONE_MINUS_SRC_ALPHA:
+				case CELL_GCM_DST_ALPHA:
+				case CELL_GCM_ONE_MINUS_DST_ALPHA:
+				case CELL_GCM_DST_COLOR:
+				case CELL_GCM_ONE_MINUS_DST_COLOR:
+				case CELL_GCM_SRC_ALPHA_SATURATE:
+				case CELL_GCM_CONSTANT_COLOR:
+				case CELL_GCM_ONE_MINUS_CONSTANT_COLOR:
+				case CELL_GCM_CONSTANT_ALPHA:
+				case CELL_GCM_ONE_MINUS_CONSTANT_ALPHA:
+					break;
+
+				default:
+					// Ignore invalid values as a whole
+					method_registers.decode(reg, method_registers.register_previous_value);
+					return;
 				}
 			}
 		}
@@ -980,11 +1038,6 @@ namespace rsx
 			const f32 scale_x = method_registers.blit_engine_ds_dx();
 			const f32 scale_y = method_registers.blit_engine_dt_dy();
 
-			// NOTE: Do not round these value up!
-			// Sub-pixel offsets are used to signify pixel centers and do not mean to read from the next block (fill convention)
-			auto in_x = static_cast<u16>(std::floor(method_registers.blit_engine_in_x()));
-			auto in_y = static_cast<u16>(std::floor(method_registers.blit_engine_in_y()));
-
 			// Clipping
 			// Validate that clipping rect will fit onto both src and dst regions
 			const u16 clip_w = std::min(method_registers.blit_engine_clip_width(), out_w);
@@ -1068,24 +1121,37 @@ namespace rsx
 				out_pitch = out_bpp * out_w;
 			}
 
-			if (in_x == 1 || in_y == 1) [[unlikely]]
+			if (in_bpp != out_bpp)
 			{
-				if (is_block_transfer && in_bpp == out_bpp)
-				{
-					// No scaling factor, so size in src == size in dst
-					// Check for texel wrapping where (offset + size) > size by 1 pixel
-					// TODO: Should properly RE this behaviour when I have time (kd-11)
-					if (in_x == 1 && in_w == clip_w) in_x = 0;
-					if (in_y == 1 && in_h == clip_h) in_y = 0;
-				}
-				else
-				{
-					// Graphics operation, ignore subpixel correction offsets
-					if (in_x == 1) in_x = 0;
-					if (in_y == 1) in_y = 0;
+				is_block_transfer = false;
+			}
 
-					is_block_transfer = false;
-				}
+			u16 in_x, in_y;
+			if (in_origin == blit_engine::transfer_origin::center)
+			{
+				// Convert to normal u,v addressing. Under this scheme offset of 1 is actually half-way inside pixel 0
+				const float x = std::max(method_registers.blit_engine_in_x(), 0.5f);
+				const float y = std::max(method_registers.blit_engine_in_y(), 0.5f);
+				in_x = static_cast<u16>(std::floor(x - 0.5f));
+				in_y = static_cast<u16>(std::floor(y - 0.5f));
+			}
+			else
+			{
+				in_x = static_cast<u16>(std::floor(method_registers.blit_engine_in_x()));
+				in_y = static_cast<u16>(std::floor(method_registers.blit_engine_in_y()));
+			}
+
+			// Check for subpixel addressing
+			if (scale_x < 1.f)
+			{
+				float dst_x = in_x * scale_x;
+				in_x = static_cast<u16>(std::floor(dst_x) / scale_x);
+			}
+
+			if (scale_y < 1.f)
+			{
+				float dst_y = in_y * scale_y;
+				in_y = static_cast<u16>(std::floor(dst_y) / scale_y);
 			}
 
 			const u32 in_offset = in_x * in_bpp + in_pitch * in_y;
@@ -3084,6 +3150,16 @@ namespace rsx
 		bind<NV4097_SET_DEPTH_MASK, nv4097::set_surface_options_dirty_bit>();
 		bind<NV4097_SET_COLOR_MASK, nv4097::set_surface_options_dirty_bit>();
 		bind<NV4097_SET_COLOR_MASK_MRT, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_STENCIL_MASK, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_STENCIL_OP_ZPASS, nv4097::set_stencil_op>();
+		bind<NV4097_SET_STENCIL_OP_FAIL, nv4097::set_stencil_op>();
+		bind<NV4097_SET_STENCIL_OP_ZFAIL, nv4097::set_stencil_op>();
+		bind<NV4097_SET_BACK_STENCIL_MASK, nv4097::set_surface_options_dirty_bit>();
+		bind<NV4097_SET_BACK_STENCIL_OP_ZPASS, nv4097::set_stencil_op>();
+		bind<NV4097_SET_BACK_STENCIL_OP_FAIL, nv4097::set_stencil_op>();
+		bind<NV4097_SET_BACK_STENCIL_OP_ZFAIL, nv4097::set_stencil_op>();
 		bind<NV4097_WAIT_FOR_IDLE, nv4097::sync>();
 		bind<NV4097_INVALIDATE_L2, nv4097::set_shader_program_dirty>();
 		bind<NV4097_SET_SHADER_PROGRAM, nv4097::set_shader_program_dirty>();
@@ -3112,6 +3188,10 @@ namespace rsx
 		bind_range<NV4097_SET_VIEWPORT_OFFSET, 1, 3, nv4097::set_viewport_dirty_bit>();
 		bind<NV4097_SET_INDEX_ARRAY_DMA, nv4097::check_index_array_dma>();
 		bind<NV4097_SET_BLEND_EQUATION, nv4097::set_blend_equation>();
+		bind<NV4097_SET_BLEND_FUNC_SFACTOR, nv4097::set_blend_factor>();
+		bind<NV4097_SET_BLEND_FUNC_DFACTOR, nv4097::set_blend_factor>();
+		bind<NV4097_SET_POLYGON_STIPPLE, nv4097::notify_state_changed<fragment_state_dirty>>();
+		bind_array<NV4097_SET_POLYGON_STIPPLE_PATTERN, 1, 32, nv4097::notify_state_changed<polygon_stipple_pattern_dirty>>();
 
 		//NV308A (0xa400..0xbffc!)
 		bind_range<NV308A_COLOR + (256 * 0), 1, 256, nv308a::color, 256 * 0>();

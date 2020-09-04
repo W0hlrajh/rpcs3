@@ -35,14 +35,16 @@ struct cfg_root : cfg::node
 		cfg::_bool set_daz_and_ftz{ this, "Set DAZ and FTZ", false };
 		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::llvm };
 		cfg::_bool lower_spu_priority{ this, "Lower SPU thread priority" };
+		cfg::_bool spu_getllar_polling_detection{ this, "SPU GETLLAR polling detection", false, true };
 		cfg::_bool spu_debug{ this, "SPU Debug" };
 		cfg::_int<0, 6> preferred_spu_threads{ this, "Preferred SPU Threads", 0, true }; // Number of hardware threads dedicated to heavy simultaneous spu tasks
 		cfg::_int<0, 16> spu_delay_penalty{ this, "SPU delay penalty", 3 }; // Number of milliseconds to block a thread if a virtual 'core' isn't free
-		cfg::_bool spu_loop_detection{ this, "SPU loop detection", true }; // Try to detect wait loops and trigger thread yield
+		cfg::_bool spu_loop_detection{ this, "SPU loop detection", true, true }; // Try to detect wait loops and trigger thread yield
 		cfg::_int<0, 6> max_spurs_threads{ this, "Max SPURS Threads", 6 }; // HACK. If less then 6, max number of running SPURS threads in each thread group.
 		cfg::_enum<spu_block_size_type> spu_block_size{ this, "SPU Block Size", spu_block_size_type::safe };
-		cfg::_bool spu_accurate_getllar{ this, "Accurate GETLLAR", false };
-		cfg::_bool spu_accurate_putlluc{ this, "Accurate PUTLLUC", false };
+		cfg::_bool spu_accurate_getllar{ this, "Accurate GETLLAR", false, true };
+		cfg::_bool spu_accurate_putlluc{ this, "Accurate PUTLLUC", false, true };
+		cfg::_bool spu_accurate_dma{ this, "Accurate SPU DMA", false };
 		cfg::_bool rsx_accurate_res_access{this, "Accurate RSX reservation access", false, true};
 		cfg::_bool spu_verification{ this, "SPU Verification", true }; // Should be enabled
 		cfg::_bool spu_cache{ this, "SPU Cache", true };
@@ -51,7 +53,9 @@ struct cfg_root : cfg::node
 		cfg::_bool spu_accurate_xfloat{ this, "Accurate xfloat", false };
 		cfg::_bool spu_approx_xfloat{ this, "Approximate xfloat", true };
 		cfg::_bool llvm_accurate_dfma{ this, "LLVM Accurate DFMA", true }; // Enable accurate double-precision FMA for CPUs which do not support it natively
+		cfg::_bool llvm_ppu_jm_handling{ this, "PPU LLVM Java Mode Handling", false }; // Respect current Java Mode for alti-vec ops by PPU LLVM 
 		cfg::_bool llvm_ppu_accurate_vector_nan{ this, "PPU LLVM Accurate Vector NaN values", false };
+		cfg::_int<-64, 64> stub_ppu_traps{ this, "Stub PPU Traps", 0, true }; // Hack, skip PPU traps for rare cases where the trap is continueable (specify relative instructions to skip)
 
 		cfg::_bool debug_console_mode{ this, "Debug Console Mode", false }; // Debug console emulation, not recommended
 		cfg::_enum<lib_loading_type> lib_loading{ this, "Lib Loader", lib_loading_type::liblv2only };
@@ -122,7 +126,7 @@ struct cfg_root : cfg::node
 		cfg::_bool stretch_to_display_area{ this, "Stretch To Display Area", false, true };
 		cfg::_bool force_high_precision_z_buffer{ this, "Force High Precision Z buffer" };
 		cfg::_bool strict_rendering_mode{ this, "Strict Rendering Mode" };
-		cfg::_bool disable_zcull_queries{ this, "Disable ZCull Occlusion Queries", false };
+		cfg::_bool disable_zcull_queries{ this, "Disable ZCull Occlusion Queries", false, true };
 		cfg::_bool disable_vertex_cache{ this, "Disable Vertex Cache", false };
 		cfg::_bool disable_FIFO_reordering{ this, "Disable FIFO Reordering", false };
 		cfg::_bool frame_skip_enabled{ this, "Enable Frame Skip", false, true };
@@ -207,23 +211,23 @@ struct cfg_root : cfg::node
 
 		cfg::_enum<audio_renderer> renderer{ this, "Renderer",
 #ifdef _WIN32
-			audio_renderer::xaudio };
+			audio_renderer::xaudio, true };
 #elif HAVE_FAUDIO
-			audio_renderer::faudio };
+			audio_renderer::faudio, true };
 #else
-			audio_renderer::openal };
+			audio_renderer::openal, true };
 #endif
 
 		cfg::_bool dump_to_file{ this, "Dump to file" };
-		cfg::_bool convert_to_u16{ this, "Convert to 16 bit" };
-		cfg::_bool downmix_to_2ch{ this, "Downmix to Stereo", true };
-		cfg::_int<1, 128> startt{ this, "Start Threshold", 1 }; // TODO: used only by ALSA, should probably be removed once ALSA is upgraded
-		cfg::_int<0, 200> volume{ this, "Master Volume", 100 };
-		cfg::_bool enable_buffering{ this, "Enable Buffering", true };
-		cfg::_int <4, 250> desired_buffer_duration{ this, "Desired Audio Buffer Duration", 100 };
-		cfg::_int<1, 1000> sampling_period_multiplier{ this, "Sampling Period Multiplier", 100 };
-		cfg::_bool enable_time_stretching{ this, "Enable Time Stretching", false };
-		cfg::_int<0, 100> time_stretching_threshold{ this, "Time Stretching Threshold", 75 };
+		cfg::_bool convert_to_u16{ this, "Convert to 16 bit", false, true };
+		cfg::_enum<audio_downmix> audio_channel_downmix{ this, "Audio Channels", audio_downmix::downmix_to_stereo, true };
+		cfg::_int<1, 128> start_threshold{ this, "Start Threshold", 1, true }; // TODO: used only by ALSA, should probably be removed once ALSA is upgraded
+		cfg::_int<0, 200> volume{ this, "Master Volume", 100, true };
+		cfg::_bool enable_buffering{ this, "Enable Buffering", true, true };
+		cfg::_int <4, 250> desired_buffer_duration{ this, "Desired Audio Buffer Duration", 100, true };
+		cfg::_int<1, 1000> sampling_period_multiplier{ this, "Sampling Period Multiplier", 100, true };
+		cfg::_bool enable_time_stretching{ this, "Enable Time Stretching", false, true };
+		cfg::_int<0, 100> time_stretching_threshold{ this, "Time Stretching Threshold", 75, true };
 		cfg::_enum<microphone_handler> microphone_type{ this, "Microphone Type", microphone_handler::null };
 		cfg::string microphone_devices{ this, "Microphone Devices", ";;;;" };
 	} audio{ this };
@@ -259,7 +263,6 @@ struct cfg_root : cfg::node
 		cfg::string swap_list{this, "IP swap list", ""};
 
 		cfg::_enum<np_psn_status> psn_status{this, "PSN status", np_psn_status::disabled};
-		cfg::string psn_npid{this, "NPID", ""};
 	} net{this};
 
 	struct node_misc : cfg::node
@@ -269,7 +272,7 @@ struct cfg_root : cfg::node
 		cfg::_bool autostart{ this, "Automatically start games after boot", true, true };
 		cfg::_bool autoexit{ this, "Exit RPCS3 when process finishes", false, true };
 		cfg::_bool start_fullscreen{ this, "Start games in fullscreen mode", false, true };
-		cfg::_bool prevent_display_sleep{ this, "Prevent display sleep while running games", true };
+		cfg::_bool prevent_display_sleep{ this, "Prevent display sleep while running games", true, true };
 		cfg::_bool show_trophy_popups{ this, "Show trophy popups", true, true };
 		cfg::_bool show_shader_compilation_hint{ this, "Show shader compilation hint", true, true };
 		cfg::_bool use_native_interface{ this, "Use native user interface", true };

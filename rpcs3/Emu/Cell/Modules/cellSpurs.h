@@ -410,6 +410,20 @@ struct alignas(16) CellSpursTracePacket
 
 CHECK_SIZE_ALIGN(CellSpursTracePacket, 16, 16);
 
+struct alignas(128) CellSpursJobChain
+{
+	u8 unk1[0x2C];                  // 0x0
+	u8 val2C;                       // 0x2C
+	u8 val2D;                       // 0x2D
+	u8 val2E;                       // 0x2E
+	u8 val2F;                       // 0x2F
+	atomic_be_t<u64> urgentCmds[4]; // 0x30
+	u8 unk2[0x24];                  // 0x50
+	be_t<u32> workloadId;           // 0x74
+	vm::bptr<CellSpurs> spurs;      // 0x78
+	u8 unk3[0x94];                  // 0x7C
+};
+
 // Core CellSpurs structures
 struct alignas(128) CellSpurs
 {
@@ -616,7 +630,7 @@ struct alignas(128) CellSpursEventFlag
 		be_t<u16> events;                // 0x00 Event bits
 		be_t<u16> spuTaskPendingRecv;    // 0x02 A bit is set to 1 when the condition of the SPU task using the slot are met and back to 0 when the SPU task unblocks
 		be_t<u16> ppuWaitMask;           // 0x04 Wait mask for blocked PPU thread
-		u8 ppuWaitSlotAndMode;           // 0x06 Top 4 bits: Wait slot number of the blocked PPU threa, Bottom 4 bits: Wait mode of the blocked PPU thread
+		u8 ppuWaitSlotAndMode;           // 0x06 Top 4 bits: Wait slot number of the blocked PPU threads, Bottom 4 bits: Wait mode of the blocked PPU thread
 		u8 ppuPendingRecv;               // 0x07 Set to 1 when the blocked PPU thread's conditions are met and back to 0 when the PPU thread is unblocked
 	};
 

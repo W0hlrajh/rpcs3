@@ -74,7 +74,7 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
 		return add_loc->compiled;
 	}
 
-	if (auto cache = g_fxo->get<spu_cache>(); cache && g_cfg.core.spu_cache && !add_loc->cached.exchange(1))
+	if (auto cache = g_fxo->get<spu_cache>(); *cache && g_cfg.core.spu_cache && !add_loc->cached.exchange(1))
 	{
 		cache->add(func);
 	}
@@ -1252,7 +1252,6 @@ void spu_recompiler::get_events()
 	Label label1 = c->newLabel();
 	Label rcheck = c->newLabel();
 	Label tcheck = c->newLabel();
-	Label treset = c->newLabel();
 	Label label2 = c->newLabel();
 
 	// Check if reservation exists
@@ -1323,35 +1322,19 @@ void spu_recompiler::get_events()
 	});
 
 	c->bind(label1);
-	c->cmp(SPU_OFF_32(ch_dec_value), 0);
-	c->jnz(tcheck);
+	c->jmp(tcheck);
 
 	// Check decrementer event (unlikely)
 	after.emplace_back([=, this]()
 	{
 		auto sub = [](spu_thread* _spu)
 		{
-			if ((_spu->ch_dec_value - (get_timebased_time() - _spu->ch_dec_start_timestamp)) >> 31)
-			{
-				_spu->ch_event_stat |= SPU_EVENT_TM;
-			}
+			_spu->get_events(SPU_EVENT_TM);
 		};
 
 		c->bind(tcheck);
 		c->mov(*arg0, *cpu);
 		c->call(imm_ptr<void(*)(spu_thread*)>(sub));
-		c->jmp(label2);
-	});
-
-	// Check whether SPU_EVENT_TM is already set
-	c->bt(SPU_OFF_32(ch_event_stat), 5);
-	c->jnc(treset);
-
-	// Set SPU_EVENT_TM (unlikely)
-	after.emplace_back([=, this]()
-	{
-		c->bind(treset);
-		c->lock().bts(SPU_OFF_32(ch_event_stat), 5);
 		c->jmp(label2);
 	});
 
@@ -1659,8 +1642,8 @@ void spu_recompiler::RDCH(spu_opcode_t op)
 	{
 		const XmmLink& vr = XmmAlloc();
 		c->movzx(*addr, SPU_OFF_8(interrupts_enabled));
-		c->movzx(arg1->r32(), SPU_OFF_8(is_isolated));
-		c->shl(arg1->r32(), 1);
+		c->mov(arg1->r32(), SPU_OFF_32(thread_type));
+		c->and_(arg1->r32(), 2);
 		c->or_(addr->r32(), arg1->r32());
 		c->movd(vr, *addr);
 		c->pslldq(vr, 12);
@@ -1715,10 +1698,8 @@ void spu_recompiler::RCHCNT(spu_opcode_t op)
 	{
 		const XmmLink& vr = XmmAlloc();
 		const XmmLink& v1 = XmmAlloc();
-		c->movd(vr, SPU_OFF_32(ch_tag_upd));
-		c->pxor(v1, v1);
-		c->pcmpeqd(vr, v1);
-		c->psrld(vr, 31);
+		c->mov(addr->r32(), 1);
+		c->movd(vr, addr->r32());
 		c->pslldq(vr, 12);
 		c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
 		return;
@@ -2477,7 +2458,7 @@ void spu_recompiler::WRCH(spu_opcode_t op)
 		Label ret = c->newLabel();
 		c->mov(qw0->r32(), SPU_OFF_32(gpr, op.rt, &v128::_u32, 3));
 		c->mov(SPU_OFF_32(ch_tag_mask), qw0->r32());
-		c->cmp(SPU_OFF_32(ch_tag_upd), 0);
+		c->cmp(SPU_OFF_32(ch_tag_upd), MFC_TAG_UPDATE_IMMEDIATE);
 		c->jnz(upd);
 
 		after.emplace_back([=, this, pos = m_pos]
@@ -2517,7 +2498,6 @@ void spu_recompiler::WRCH(spu_opcode_t op)
 
 			c->bind(zero);
 			c->mov(SPU_OFF_32(ch_tag_upd), qw0->r32());
-			c->mov(SPU_OFF_64(ch_tag_stat), 0);
 			c->jmp(ret);
 		});
 

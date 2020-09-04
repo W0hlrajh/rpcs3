@@ -61,21 +61,14 @@ ppu_static_module::ppu_static_module(const char* name)
 	ppu_module_manager::register_module(this);
 }
 
-std::unordered_map<std::string, ppu_static_module*>& ppu_module_manager::access()
-{
-	static std::unordered_map<std::string, ppu_static_module*> map;
-
-	return map;
-}
-
 void ppu_module_manager::register_module(ppu_static_module* _module)
 {
-	access().emplace(_module->name, _module);
+	ppu_module_manager::s_module_map.emplace(_module->name, _module);
 }
 
 ppu_static_function& ppu_module_manager::access_static_function(const char* _module, u32 fnid)
 {
-	auto& res = access().at(_module)->functions[fnid];
+	auto& res = ppu_module_manager::s_module_map.at(_module)->functions[fnid];
 
 	if (res.name)
 	{
@@ -87,7 +80,7 @@ ppu_static_function& ppu_module_manager::access_static_function(const char* _mod
 
 ppu_static_variable& ppu_module_manager::access_static_variable(const char* _module, u32 vnid)
 {
-	auto& res = access().at(_module)->variables[vnid];
+	auto& res = ppu_module_manager::s_module_map.at(_module)->variables[vnid];
 
 	if (res.name)
 	{
@@ -99,7 +92,7 @@ ppu_static_variable& ppu_module_manager::access_static_variable(const char* _mod
 
 const ppu_static_module* ppu_module_manager::get_module(const std::string& name)
 {
-	const auto& map = access();
+	const auto& map = ppu_module_manager::s_module_map;
 	const auto found = map.find(name);
 	return found != map.end() ? found->second : nullptr;
 }
@@ -744,7 +737,7 @@ std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, const std::stri
 
 				// Copy segment data
 				std::memcpy(vm::base(addr), prog.bin.data(), file_size);
-				ppu_loader.warning("**** Loaded to 0x%x (size=0x%x)", addr, mem_size);
+				ppu_loader.warning("**** Loaded to 0x%x...0x%x (size=0x%x)", addr, addr + mem_size - 1, mem_size);
 
 				// Hash segment
 				sha1_update(&sha, reinterpret_cast<const uchar*>(&prog.p_vaddr), sizeof(prog.p_vaddr));
@@ -973,7 +966,7 @@ std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, const std::stri
 		applied += g_fxo->get<patch_engine>()->apply(Emu.GetTitleID() + '-' + hash, vm::g_base_addr);
 	}
 
-	ppu_loader.notice("PRX library hash: %s (<- %u)", hash, applied);
+	ppu_loader.success("PRX library hash: %s (<- %u)", hash, applied);
 
 	if (Emu.IsReady() && g_fxo->get<ppu_module>()->segs.empty())
 	{
@@ -1134,7 +1127,7 @@ void ppu_load_exec(const ppu_exec_object& elf)
 		applied += g_fxo->get<patch_engine>()->apply(Emu.GetTitleID() + '-' + hash, vm::g_base_addr);
 	}
 
-	ppu_loader.notice("PPU executable hash: %s (<- %u)", hash, applied);
+	ppu_loader.success("PPU executable hash: %s (<- %u)", hash, applied);
 
 	// Initialize HLE modules
 	ppu_initialize_modules(link);
@@ -1209,7 +1202,7 @@ void ppu_load_exec(const ppu_exec_object& elf)
 			}
 		}
 
-		ppu_loader.notice("SPU executable hash: %s (<- %u)%s", hash, applied, dump);
+		ppu_loader.success("SPU executable hash: %s (<- %u)%s", hash, applied, dump);
 
 	}
 
@@ -1518,7 +1511,7 @@ void ppu_load_exec(const ppu_exec_object& elf)
 	p.stack_addr = vm::cast(vm::alloc(primary_stacksize, vm::stack, 4096));
 	p.stack_size = primary_stacksize;
 
-	auto ppu = idm::make_ptr<named_thread<ppu_thread>>("PPU[0x1000000] Thread (main_thread)", p, "main_thread", primary_prio, 1);
+	auto ppu = idm::make_ptr<named_thread<ppu_thread>>("PPU[0x1000000] main_thread ", p, "main_thread", primary_prio, 1);
 
 	// Write initial data (exitspawn)
 	if (!Emu.data.empty())
@@ -1672,7 +1665,7 @@ std::shared_ptr<lv2_overlay> ppu_load_overlay(const ppu_exec_object& elf, const 
 		applied += g_fxo->get<patch_engine>()->apply(Emu.GetTitleID() + '-' + hash, vm::g_base_addr);
 	}
 
-	ppu_loader.notice("OVL executable hash: %s (<- %u)", hash, applied);
+	ppu_loader.success("OVL executable hash: %s (<- %u)", hash, applied);
 
 	// Load other programs
 	for (auto& prog : elf.progs)

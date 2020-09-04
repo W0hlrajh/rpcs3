@@ -32,6 +32,14 @@ namespace rsx
 
 	extern atomic_t<u64> g_rsx_shared_tag;
 
+	enum class problem_severity : u8
+	{
+		low,
+		moderate,
+		severe,
+		fatal
+	};
+
 	//Base for resources with reference counting
 	class ref_counted
 	{
@@ -107,8 +115,7 @@ namespace rsx
 		u32 pitch = 0;
 
 		rsx::surface_color_format color_format;
-		rsx::surface_depth_format depth_format;
-		bool depth_buffer_float;
+		rsx::surface_depth_format2 depth_format;
 
 		u16 width = 0;
 		u16 height = 0;
@@ -238,18 +245,17 @@ namespace rsx
 		}
 	}
 
-	//
-	static inline u32 floor_log2(u32 value)
+	static constexpr u32 floor_log2(u32 value)
 	{
 		return value <= 1 ? 0 : std::countl_zero(value) ^ 31;
 	}
 
-	static inline u32 ceil_log2(u32 value)
+	static constexpr u32 ceil_log2(u32 value)
 	{
-		return value <= 1 ? 0 : std::countl_zero((value - 1) << 1) ^ 31;
+		return floor_log2(value) + u32{!!(value & (value - 1))};
 	}
 
-	static inline u32 next_pow2(u32 x)
+	static constexpr u32 next_pow2(u32 x)
 	{
 		if (x <= 2) return x;
 
@@ -738,12 +744,36 @@ namespace rsx
 		return result;
 	}
 
-	static inline void get_g8b8_r8g8_colormask(bool &red, bool &green, bool &blue, bool &alpha)
+	static inline void get_g8b8_r8g8_colormask(bool &red, bool &/*green*/, bool &blue, bool &alpha)
 	{
 		red = blue;
-		green = green;
 		blue = false;
 		alpha = false;
+	}
+
+	static inline void get_g8b8_clear_color(u8& red, u8& /*green*/, u8& blue, u8& /*alpha*/)
+	{
+		red = blue;
+	}
+
+	static inline u32 get_abgr8_colormask(u32 mask)
+	{
+		u32 result = 0;
+		if (mask & 0x10) result |= 0x40;
+		if (mask & 0x20) result |= 0x20;
+		if (mask & 0x40) result |= 0x10;
+		if (mask & 0x80) result |= 0x80;
+		return result;
+	}
+
+	static inline void get_abgr8_colormask(bool& red, bool& /*green*/, bool& blue, bool& /*alpha*/)
+	{
+		std::swap(red, blue);
+	}
+
+	static inline void get_abgr8_clear_color(u8& red, u8& /*green*/, u8& blue, u8& /*alpha*/)
+	{
+		std::swap(red, blue);
 	}
 
 	static inline color4f decode_border_color(u32 colorref)

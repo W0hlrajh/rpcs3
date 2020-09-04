@@ -190,6 +190,11 @@ void GLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 	OS << "{\n";
 	OS << "	sampler_info texture_parameters[16];\n";
 	OS << "};\n\n";
+
+	OS << "layout(std140, binding = " << GL_RASTERIZER_STATE_BIND_SLOT << ") uniform RasterizerHeap\n";
+	OS << "{\n";
+	OS << "	uvec4 stipple_pattern[8];\n";
+	OS << "};\n\n";
 }
 
 void GLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
@@ -201,6 +206,7 @@ void GLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 	m_shader_props.require_wpos = !!(properties.in_register_mask & in_wpos);
 	m_shader_props.require_texture_ops = properties.has_tex_op;
 	m_shader_props.require_shadow_ops = m_prog.shadow_textures != 0;
+	m_shader_props.require_texture_expand = properties.has_exp_tex_op;
 	m_shader_props.emulate_coverage_tests = true; // g_cfg.video.antialiasing_level == msaa_level::none;
 	m_shader_props.emulate_shadow_compare = device_props.emulate_depth_compare;
 	m_shader_props.low_precision_tests = ::gl::get_driver_caps().vendor_NVIDIA;
@@ -302,6 +308,8 @@ void GLFragmentDecompilerThread::insertMainEnd(std::stringstream & OS)
 
 	OS << "void main()\n";
 	OS << "{\n";
+
+	::glsl::insert_rop_init(OS);
 
 	OS << "\n" << "	fs_main();\n\n";
 
