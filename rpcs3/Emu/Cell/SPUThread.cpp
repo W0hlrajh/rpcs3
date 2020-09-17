@@ -140,8 +140,7 @@ static FORCE_INLINE bool cmp_rdata(const decltype(spu_thread::rdata)& lhs, const
 
 static FORCE_INLINE void mov_rdata_avx(__m256i* dst, const __m256i* src)
 {
-#if defined(_MSC_VER) || defined(__AVX2__)
-	// In AVX-only mode, for some older CPU models, GCC/Clang may emit 128-bit loads/stores instead.
+#ifdef _MSC_VER
 	_mm256_storeu_si256(dst + 0, _mm256_loadu_si256(src + 0));
 	_mm256_storeu_si256(dst + 1, _mm256_loadu_si256(src + 1));
 	_mm256_storeu_si256(dst + 2, _mm256_loadu_si256(src + 2));
@@ -3353,10 +3352,22 @@ bool spu_thread::stop_and_signal(u32 code)
 
 			for (auto& thread : group->threads)
 			{
-				if (thread && thread.get() != this)
+				if (thread)
 				{
-					thread->state += cpu_flag::stop + cpu_flag::ret;
-					thread_ctrl::raw_notify(*thread);
+					thread->state.fetch_op([](bs_t<cpu_flag>& flags)
+					{
+						if (flags & cpu_flag::stop)
+						{
+							// In case the thread raised the ret flag itself at some point do not raise it again
+							return false;
+						}
+
+						flags += cpu_flag::stop + cpu_flag::ret;
+						return true;
+					});
+
+					if (thread.get() != this)
+						thread_ctrl::raw_notify(*thread);
 				}
 			}
 
@@ -3366,7 +3377,6 @@ bool spu_thread::stop_and_signal(u32 code)
 			break;
 		}
 
-		state += cpu_flag::stop + cpu_flag::ret;
 		check_state();
 		return true;
 	}
