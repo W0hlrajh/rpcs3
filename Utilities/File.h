@@ -8,12 +8,15 @@
 #include <vector>
 #include <algorithm>
 
-
 namespace fs
 {
 #ifdef _WIN32
+	static constexpr auto delim = "/\\";
+	static constexpr auto wdelim = L"/\\";
 	using native_handle = void*;
 #else
+	static constexpr auto delim = "/";
+	static constexpr auto wdelim = L"/";
 	using native_handle = int;
 #endif
 
@@ -497,6 +500,9 @@ namespace fs
 
 	// Get common cache directory
 	const std::string& get_cache_dir();
+
+	// Get real path for comparisons (TODO: investigate std::filesystem::path::compare implementation)
+	std::string escape_path(std::string_view path);
 
 	// Delete directory and all its contents recursively
 	bool remove_all(const std::string& path, bool remove_root = true);
