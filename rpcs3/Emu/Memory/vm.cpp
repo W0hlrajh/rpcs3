@@ -14,7 +14,7 @@
 #include "Emu/Cell/lv2/sys_memory.h"
 #include "Emu/RSX/GSRender.h"
 #include "Emu/Cell/SPURecompiler.h"
-#include <atomic>
+#include "Emu/perf_meter.hpp"
 #include <thread>
 #include <deque>
 
@@ -80,15 +80,25 @@ namespace vm
 	// Memory pages
 	std::array<memory_page, 0x100000000 / 4096> g_pages{};
 
-	void reservation_update(u32 addr, u32 size, bool lsb)
+	std::pair<bool, u64> try_reservation_update(u32 addr)
+	{
+		// Update reservation info with new timestamp
+		auto& res = reservation_acquire(addr, 1);
+		const u64 rtime = res;
+
+		return {!(rtime & vm::rsrv_unique_lock) && res.compare_and_swap_test(rtime, rtime + 128), rtime};
+	}
+
+	void reservation_update(u32 addr)
 	{
 		u64 old = UINT64_MAX;
 		const auto cpu = get_current_cpu_thread();
 
 		while (true)
 		{
-			const auto [ok, rtime] = try_reservation_update(addr, size, lsb);
-			if (ok || old / 128 < rtime / 128)
+			const auto [ok, rtime] = try_reservation_update(addr);
+
+			if (ok || (old & -128) < (rtime & -128))
 			{
 				return;
 			}
@@ -381,6 +391,8 @@ namespace vm
 
 		if (addr >= 0x10000)
 		{
+			perf_meter<"SUSPEND"_u64> perf0;
+
 			for (auto lock = g_locks.cbegin(), end = lock + g_cfg.core.ppu_threads; lock != end; lock++)
 			{
 				if (auto ptr = +*lock; ptr && !(ptr->state & cpu_flag::memory))
@@ -441,11 +453,11 @@ namespace vm
 		g_mutex.unlock();
 	}
 
-	u64 reservation_lock_internal(u32 addr, atomic_t<u64>& res, u64 lock_bits)
+	u64 reservation_lock_internal(u32 addr, atomic_t<u64>& res)
 	{
 		for (u64 i = 0;; i++)
 		{
-			if (u64 rtime = res; !(rtime & 127) && reservation_trylock(res, rtime, lock_bits)) [[likely]]
+			if (u64 rtime = res; !(rtime & 127) && reservation_try_lock(res, rtime)) [[likely]]
 			{
 				return rtime;
 			}
@@ -471,35 +483,44 @@ namespace vm
 		}
 	}
 
-	void reservation_op_internal(u32 addr, std::function<bool()> func)
+	void reservation_shared_lock_internal(atomic_t<u64>& res)
 	{
-		const auto _cpu = get_current_cpu_thread();
-
-		// Acknowledge contender if necessary (TODO: check)
-		_cpu->state += cpu_flag::wait;
-
+		for (u64 i = 0;; i++)
 		{
-			cpu_thread::suspend_all cpu_lock(_cpu);
-
-			// Wait to acquire PUTLLUC lock
-			while (vm::reservation_acquire(addr, 128).bts(std::countr_zero<u32>(vm::putlluc_lockb)))
+			if (!(res & rsrv_unique_lock)) [[likely]]
 			{
-				busy_wait(100);
+				return;
 			}
 
-			if (func())
+			if (auto cpu = get_current_cpu_thread(); cpu && cpu->state)
 			{
-				// Success, release PUTLLUC and PUTLLC locks if necessary
-				vm::reservation_acquire(addr, 128) += 63;
+				cpu->check_state();
+			}
+			else if (i < 15)
+			{
+				busy_wait(500);
 			}
 			else
 			{
-				// Fake update (TODO)
-				vm::reservation_acquire(addr, 128) += 63;
+				std::this_thread::yield();
 			}
 		}
+	}
 
-		vm::reservation_notifier(addr, 128).notify_all();
+	void reservation_op_internal(u32 addr, std::function<bool()> func)
+	{
+		cpu_thread::suspend_all(get_current_cpu_thread(), [&]
+		{
+			if (func())
+			{
+				// Success, release all locks if necessary
+				vm::reservation_acquire(addr, 128) += 127;
+			}
+			else
+			{
+				vm::reservation_acquire(addr, 128) -= 1;
+			}
+		});
 	}
 
 	void reservation_escape_internal()
