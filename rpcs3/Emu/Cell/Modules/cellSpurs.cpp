@@ -509,7 +509,7 @@ bool _spurs::is_libprof_loaded()
 
 s32 _spurs::create_lv2_eq(ppu_thread& ppu, vm::ptr<CellSpurs> spurs, vm::ptr<u32> queueId, vm::ptr<u8> port, s32 size, const sys_event_queue_attribute_t& attr)
 {
-	if (s32 rc = sys_event_queue_create(queueId, vm::make_var(attr), SYS_EVENT_QUEUE_LOCAL, size))
+	if (s32 rc = sys_event_queue_create(ppu, queueId, vm::make_var(attr), SYS_EVENT_QUEUE_LOCAL, size))
 	{
 		return rc;
 	}
@@ -895,7 +895,7 @@ s32 _spurs::create_event_helper(ppu_thread& ppu, vm::ptr<CellSpurs> spurs, u32 p
 		return rc;
 	}
 
-	if (s32 rc = sys_event_port_create(spurs.ptr(&CellSpurs::eventPort), SYS_EVENT_PORT_LOCAL, SYS_EVENT_PORT_NO_NAME))
+	if (s32 rc = sys_event_port_create(ppu, spurs.ptr(&CellSpurs::eventPort), SYS_EVENT_PORT_LOCAL, SYS_EVENT_PORT_NO_NAME))
 	{
 		if (s32 rc2 = _spurs::detach_lv2_eq(spurs, spurs->spuPort, true))
 		{
@@ -906,7 +906,7 @@ s32 _spurs::create_event_helper(ppu_thread& ppu, vm::ptr<CellSpurs> spurs, u32 p
 		return CELL_SPURS_CORE_ERROR_AGAIN;
 	}
 
-	if (s32 rc = sys_event_port_connect_local(spurs->eventPort, spurs->eventQueue))
+	if (s32 rc = sys_event_port_connect_local(ppu, spurs->eventPort, spurs->eventQueue))
 	{
 		sys_event_port_destroy(ppu, spurs->eventPort);
 
@@ -2401,19 +2401,19 @@ s32 _spurs::add_workload(vm::ptr<CellSpurs> spurs, vm::ptr<u32> wid, vm::cptr<vo
 		spurs->wklIdleSpuCountOrReadyCount2[wnum] = 0;
 	}
 
+	vm::reservation_light_op(spurs->wklMaxContention[index], [&](atomic_t<u8>& data)
 	{
-		auto [res, rtime] = vm::reservation_lock(spurs.addr());
-
-		spurs->wklMaxContention[index].atomic_op([wnum, maxContention](u8& v)
+		data.atomic_op([&](u8& v)
 		{
 			v &= (wnum <= 15 ? ~0xf : ~0xf0);
 			v |= (maxContention > 8 ? 8 : maxContention) << 4;
 		});
-		(wnum <= 15 ? spurs->wklSignal1 : spurs->wklSignal2).fetch_and(~(0x8000 >> index));
+	});
 
-		res.release(rtime + 128);
-		res.notify_all();
-	}
+	vm::reservation_light_op<true>((wnum <= 15 ? spurs->wklSignal1 : spurs->wklSignal2), [&](atomic_be_t<u16>& data)
+	{
+		data &= ~(0x8000 >> index);
+	});
 
 	spurs->wklFlagReceiver.compare_and_swap(wnum, 0xff);
 
@@ -3523,10 +3523,10 @@ s32 cellSpursEventFlagAttachLv2EventQueue(ppu_thread& ppu, vm::ptr<CellSpursEven
 	{
 		vm::var<u32> eventPortId;
 
-		s32 rc = sys_event_port_create(eventPortId, SYS_EVENT_PORT_LOCAL, 0);
+		s32 rc = sys_event_port_create(ppu, eventPortId, SYS_EVENT_PORT_LOCAL, 0);
 		if (rc == CELL_OK)
 		{
-			rc = sys_event_port_connect_local(*eventPortId, *eventQueueId);
+			rc = sys_event_port_connect_local(ppu, *eventPortId, *eventQueueId);
 			if (rc == CELL_OK)
 			{
 				eventFlag->eventPortId = *eventPortId;

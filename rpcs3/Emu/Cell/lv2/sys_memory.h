@@ -9,6 +9,8 @@ static constexpr u64 mem_user1m_size = 0x20000000;
 static constexpr u64 mem_stack_base = 0xA0000000, mem_stack_size = 0x10000000;
 static constexpr u64 mem_rsx_base = 0xC0000000, mem_rsx_size = 0x20000000;
 
+class cpu_thread;
+
 enum : u32
 {
 	SYS_MEMORY_CONTAINER_ID_INVALID = 0xFFFFFFFF,
@@ -94,12 +96,12 @@ struct sys_memory_user_memory_stat_t
 };
 
 // SysCalls
-error_code sys_memory_allocate(u32 size, u64 flags, vm::ptr<u32> alloc_addr);
-error_code sys_memory_allocate_from_container(u32 size, u32 cid, u64 flags, vm::ptr<u32> alloc_addr);
-error_code sys_memory_free(u32 start_addr);
-error_code sys_memory_get_page_attribute(u32 addr, vm::ptr<sys_page_attr_t> attr);
-error_code sys_memory_get_user_memory_size(vm::ptr<sys_memory_info_t> mem_info);
-error_code sys_memory_get_user_memory_stat(vm::ptr<sys_memory_user_memory_stat_t> mem_stat);
-error_code sys_memory_container_create(vm::ptr<u32> cid, u32 size);
-error_code sys_memory_container_destroy(u32 cid);
-error_code sys_memory_container_get_size(vm::ptr<sys_memory_info_t> mem_info, u32 cid);
+error_code sys_memory_allocate(cpu_thread& cpu, u32 size, u64 flags, vm::ptr<u32> alloc_addr);
+error_code sys_memory_allocate_from_container(cpu_thread& cpu, u32 size, u32 cid, u64 flags, vm::ptr<u32> alloc_addr);
+error_code sys_memory_free(cpu_thread& cpu, u32 start_addr);
+error_code sys_memory_get_page_attribute(cpu_thread& cpu, u32 addr, vm::ptr<sys_page_attr_t> attr);
+error_code sys_memory_get_user_memory_size(cpu_thread& cpu, vm::ptr<sys_memory_info_t> mem_info);
+error_code sys_memory_get_user_memory_stat(cpu_thread& cpu, vm::ptr<sys_memory_user_memory_stat_t> mem_stat);
+error_code sys_memory_container_create(cpu_thread& cpu, vm::ptr<u32> cid, u32 size);
+error_code sys_memory_container_destroy(cpu_thread& cpu, u32 cid);
+error_code sys_memory_container_get_size(cpu_thread& cpu, vm::ptr<sys_memory_info_t> mem_info, u32 cid);
