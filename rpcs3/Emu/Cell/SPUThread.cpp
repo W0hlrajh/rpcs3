@@ -371,7 +371,7 @@ namespace spu
 	}
 }
 
-const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void* _old, const void* _new)>([](asmjit::X86Assembler& c, auto& args)
+const auto spu_putllc_tx = build_function_asm<u64(*)(u32 raddr, u64 rtime, void* _old, const void* _new)>([](asmjit::X86Assembler& c, auto& args)
 {
 	using namespace asmjit;
 
@@ -415,17 +415,15 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 #endif
 
 	// Prepare registers
-	c.mov(x86::rbx, imm_ptr(+vm::g_reservations));
-	c.mov(x86::rax, imm_ptr(&vm::g_sudo_addr));
-	c.mov(x86::rbp, x86::qword_ptr(x86::rax));
+	build_swap_rdx_with(c, args, x86::r12);
+	c.mov(x86::rbp, x86::qword_ptr(reinterpret_cast<u64>(&vm::g_sudo_addr)));
 	c.lea(x86::rbp, x86::qword_ptr(x86::rbp, args[0]));
 	c.prefetchw(x86::byte_ptr(x86::rbp, 0));
 	c.prefetchw(x86::byte_ptr(x86::rbp, 64));
 	c.and_(args[0].r32(), 0xff80);
 	c.shr(args[0].r32(), 1);
-	c.lea(x86::rbx, x86::qword_ptr(x86::rbx, args[0]));
+	c.lea(x86::rbx, x86::qword_ptr(reinterpret_cast<u64>(+vm::g_reservations), args[0]));
 	c.prefetchw(x86::byte_ptr(x86::rbx));
-	c.mov(x86::r12d, 1);
 	c.mov(x86::r13, args[1]);
 
 	// Prepare data
@@ -460,10 +458,20 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 		c.movaps(x86::xmm15, x86::oword_ptr(args[3], 112));
 	}
 
+	// Alloc args[0] to stamp0
+	const auto stamp0 = args[0];
+	const auto stamp1 = args[1];
+	build_get_tsc(c, stamp0);
+
 	// Begin transaction
-	Label tx0 = build_transaction_enter(c, fall, x86::r12d, 4, [&]()
+	Label tx0 = build_transaction_enter(c, fall, [&]()
 	{
 		c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::ftx) - ::offset32(&spu_thread::rdata)), 1);
+		build_get_tsc(c, stamp1);
+		c.sub(stamp1, stamp0);
+		c.xor_(x86::eax, x86::eax);
+		c.cmp(stamp1, x86::qword_ptr(reinterpret_cast<u64>(&g_rtm_tx_limit1)));
+		c.jae(fall);
 	});
 	c.bt(x86::dword_ptr(args[2], ::offset32(&spu_thread::state) - ::offset32(&spu_thread::rdata)), static_cast<u32>(cpu_flag::pause));
 	c.mov(x86::eax, _XABORT_EXPLICIT);
@@ -531,7 +539,8 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 	c.sub(x86::qword_ptr(x86::rbx), -128);
 	c.xend();
 	c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::stx) - ::offset32(&spu_thread::rdata)), 1);
-	c.mov(x86::eax, x86::r12d);
+	build_get_tsc(c);
+	c.sub(x86::rax, stamp0);
 	c.jmp(_ret);
 
 	// XABORT is expensive so finish with xend instead
@@ -564,6 +573,7 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 	c.bind(skip);
 	c.xend();
 	c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::stx) - ::offset32(&spu_thread::rdata)), 1);
+	build_get_tsc(c, stamp1);
 	c.mov(x86::eax, _XABORT_EXPLICIT);
 	//c.jmp(fall);
 
@@ -589,13 +599,28 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 	c.test(x86::eax, vm::rsrv_unique_lock);
 	c.jnz(fail2);
 
-	// Allow only first shared lock to proceed
+	// Check if already updated
+	c.and_(x86::rax, -128);
 	c.cmp(x86::rax, x86::r13);
 	c.jne(fail2);
 
-	Label tx1 = build_transaction_enter(c, fall2, x86::r12d, 666, [&]()
+	// Exclude some time spent on touching memory: stamp1 contains last success or failure
+	c.mov(x86::rax, stamp1);
+	c.sub(x86::rax, stamp0);
+	build_get_tsc(c, stamp1);
+	c.sub(stamp1, x86::rax);
+	c.cmp(x86::rax, x86::qword_ptr(reinterpret_cast<u64>(&g_rtm_tx_limit2)));
+	c.jae(fall2);
+
+	Label tx1 = build_transaction_enter(c, fall2, [&]()
 	{
 		c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::ftx) - ::offset32(&spu_thread::rdata)), 1);
+		build_get_tsc(c);
+		c.sub(x86::rax, stamp1);
+		c.cmp(x86::rax, x86::qword_ptr(reinterpret_cast<u64>(&g_rtm_tx_limit2)));
+		c.jae(fall2);
+		c.test(x86::qword_ptr(x86::rbx), 127 - 1);
+		c.jnz(fall2);
 	});
 	c.prefetchw(x86::byte_ptr(x86::rbp, 0));
 	c.prefetchw(x86::byte_ptr(x86::rbp, 64));
@@ -604,8 +629,6 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 	c.bt(x86::dword_ptr(args[2], ::offset32(&spu_thread::state) - ::offset32(&spu_thread::rdata)), static_cast<u32>(cpu_flag::pause));
 	c.jc(fall2);
 	c.mov(x86::rax, x86::qword_ptr(x86::rbx));
-	c.test(x86::rax, 127 - 1);
-	c.jnz(fall2);
 	c.and_(x86::rax, -128);
 	c.cmp(x86::rax, x86::r13);
 	c.jne(fail2);
@@ -666,7 +689,8 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 	c.xend();
 	c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::stx) - ::offset32(&spu_thread::rdata)), 1);
 	c.lock().add(x86::qword_ptr(x86::rbx), 127);
-	c.mov(x86::eax, x86::r12d);
+	build_get_tsc(c);
+	c.sub(x86::rax, stamp0);
 	c.jmp(_ret);
 
 	// XABORT is expensive so try to finish with xend instead
@@ -697,7 +721,7 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 	c.jmp(fail2);
 
 	c.bind(fall2);
-	c.mov(x86::eax, -1);
+	c.mov(x86::rax, -1);
 	c.jmp(_ret);
 
 	c.bind(fail2);
@@ -724,6 +748,8 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 		c.movaps(x86::oword_ptr(args[2], 112), x86::xmm7);
 	}
 
+	c.mov(x86::rax, -1);
+	c.mov(x86::qword_ptr(args[2], ::offset32(&spu_thread::last_ftime) - ::offset32(&spu_thread::rdata)), x86::rax);
 	c.xor_(x86::eax, x86::eax);
 	//c.jmp(_ret);
 
@@ -763,7 +789,7 @@ const auto spu_putllc_tx = build_function_asm<u32(*)(u32 raddr, u64 rtime, void*
 	c.ret();
 });
 
-const auto spu_putlluc_tx = build_function_asm<u32(*)(u32 raddr, const void* rdata, cpu_thread* _spu)>([](asmjit::X86Assembler& c, auto& args)
+const auto spu_putlluc_tx = build_function_asm<u64(*)(u32 raddr, const void* rdata, cpu_thread* _spu)>([](asmjit::X86Assembler& c, auto& args)
 {
 	using namespace asmjit;
 
@@ -792,17 +818,15 @@ const auto spu_putlluc_tx = build_function_asm<u32(*)(u32 raddr, const void* rda
 #endif
 
 	// Prepare registers
-	c.mov(x86::rbx, imm_ptr(+vm::g_reservations));
-	c.mov(x86::rax, imm_ptr(&vm::g_sudo_addr));
-	c.mov(x86::rbp, x86::qword_ptr(x86::rax));
+	build_swap_rdx_with(c, args, x86::r12);
+	c.mov(x86::rbp, x86::qword_ptr(reinterpret_cast<u64>(&vm::g_sudo_addr)));
 	c.lea(x86::rbp, x86::qword_ptr(x86::rbp, args[0]));
 	c.prefetchw(x86::byte_ptr(x86::rbp, 0));
 	c.prefetchw(x86::byte_ptr(x86::rbp, 64));
 	c.and_(args[0].r32(), 0xff80);
 	c.shr(args[0].r32(), 1);
-	c.lea(x86::rbx, x86::qword_ptr(x86::rbx, args[0]));
+	c.lea(x86::rbx, x86::qword_ptr(reinterpret_cast<u64>(+vm::g_reservations), args[0]));
 	c.prefetchw(x86::byte_ptr(x86::rbx));
-	c.mov(x86::r12d, 1);
 	c.mov(x86::r13, args[1]);
 
 	// Prepare data
@@ -825,10 +849,20 @@ const auto spu_putlluc_tx = build_function_asm<u32(*)(u32 raddr, const void* rda
 		c.movaps(x86::xmm7, x86::oword_ptr(args[1], 112));
 	}
 
+	// Alloc args[0] to stamp0
+	const auto stamp0 = args[0];
+	const auto stamp1 = args[1];
+	build_get_tsc(c, stamp0);
+
 	// Begin transaction
-	Label tx0 = build_transaction_enter(c, fall, x86::r12d, 8, [&]()
+	Label tx0 = build_transaction_enter(c, fall, [&]()
 	{
 		c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::ftx)), 1);
+		build_get_tsc(c, stamp1);
+		c.sub(stamp1, stamp0);
+		c.xor_(x86::eax, x86::eax);
+		c.cmp(stamp1, x86::qword_ptr(reinterpret_cast<u64>(&g_rtm_tx_limit1)));
+		c.jae(fall);
 	});
 	c.xbegin(tx0);
 	c.test(x86::qword_ptr(x86::rbx), vm::rsrv_unique_lock);
@@ -856,12 +890,15 @@ const auto spu_putlluc_tx = build_function_asm<u32(*)(u32 raddr, const void* rda
 	c.sub(x86::qword_ptr(x86::rbx), -128);
 	c.xend();
 	c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::stx)), 1);
-	c.mov(x86::eax, 1);
+	build_get_tsc(c);
+	c.sub(x86::rax, stamp0);
 	c.jmp(_ret);
 
 	c.bind(skip);
 	c.xend();
 	c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::stx)), 1);
+	build_get_tsc(c, stamp1);
+	c.mov(x86::eax, _XABORT_EXPLICIT);
 	//c.jmp(fall);
 
 	c.bind(fall);
@@ -881,12 +918,24 @@ const auto spu_putlluc_tx = build_function_asm<u32(*)(u32 raddr, const void* rda
 	// Lock reservation
 	c.mov(x86::eax, 1);
 	c.lock().xadd(x86::qword_ptr(x86::rbx), x86::rax);
-	c.test(x86::eax, vm::rsrv_unique_lock);
+	c.test(x86::eax, 127 - 1);
 	c.jnz(fall2);
 
-	Label tx1 = build_transaction_enter(c, fall2, x86::r12d, 666, [&]()
+	// Exclude some time spent on touching memory: stamp1 contains last success or failure
+	c.mov(x86::rax, stamp1);
+	c.sub(x86::rax, stamp0);
+	c.cmp(x86::rax, x86::qword_ptr(reinterpret_cast<u64>(&g_rtm_tx_limit2)));
+	c.jae(fall2);
+	build_get_tsc(c, stamp1);
+	c.sub(stamp1, x86::rax);
+
+	Label tx1 = build_transaction_enter(c, fall2, [&]()
 	{
 		c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::ftx)), 1);
+		build_get_tsc(c);
+		c.sub(x86::rax, stamp1);
+		c.cmp(x86::rax, x86::qword_ptr(reinterpret_cast<u64>(&g_rtm_tx_limit2)));
+		c.jae(fall2);
 	});
 
 	c.prefetchw(x86::byte_ptr(x86::rbp, 0));
@@ -922,7 +971,8 @@ const auto spu_putlluc_tx = build_function_asm<u32(*)(u32 raddr, const void* rda
 	c.xend();
 	c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::stx)), 1);
 	c.lock().add(x86::qword_ptr(x86::rbx), 127);
-	c.mov(x86::eax, x86::r12d);
+	build_get_tsc(c);
+	c.sub(x86::rax, stamp0);
 	c.jmp(_ret);
 
 	c.bind(fall2);
@@ -952,7 +1002,7 @@ const auto spu_putlluc_tx = build_function_asm<u32(*)(u32 raddr, const void* rda
 	c.ret();
 });
 
-const extern auto spu_getllar_tx = build_function_asm<u32(*)(u32 raddr, void* rdata, cpu_thread* _cpu, u64 rtime)>([](asmjit::X86Assembler& c, auto& args)
+const extern auto spu_getllar_tx = build_function_asm<u64(*)(u32 raddr, void* rdata, cpu_thread* _cpu, u64 rtime)>([](asmjit::X86Assembler& c, auto& args)
 {
 	using namespace asmjit;
 
@@ -979,20 +1029,26 @@ const extern auto spu_getllar_tx = build_function_asm<u32(*)(u32 raddr, void* rd
 #endif
 
 	// Prepare registers
-	c.mov(x86::rbx, imm_ptr(+vm::g_reservations));
-	c.mov(x86::rax, imm_ptr(&vm::g_sudo_addr));
-	c.mov(x86::rbp, x86::qword_ptr(x86::rax));
+	build_swap_rdx_with(c, args, x86::r12);
+	c.mov(x86::rbp, x86::qword_ptr(reinterpret_cast<u64>(&vm::g_sudo_addr)));
 	c.lea(x86::rbp, x86::qword_ptr(x86::rbp, args[0]));
 	c.and_(args[0].r32(), 0xff80);
 	c.shr(args[0].r32(), 1);
-	c.lea(x86::rbx, x86::qword_ptr(x86::rbx, args[0]));
-	c.mov(x86::r12d, 1);
+	c.lea(x86::rbx, x86::qword_ptr(reinterpret_cast<u64>(+vm::g_reservations), args[0]));
 	c.mov(x86::r13, args[1]);
 
+	// Alloc args[0] to stamp0
+	const auto stamp0 = args[0];
+	build_get_tsc(c, stamp0);
+
 	// Begin transaction
-	Label tx0 = build_transaction_enter(c, fall, x86::r12d, 8, [&]()
+	Label tx0 = build_transaction_enter(c, fall, [&]()
 	{
 		c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::ftx)), 1);
+		build_get_tsc(c);
+		c.sub(x86::rax, stamp0);
+		c.cmp(x86::rax, x86::qword_ptr(reinterpret_cast<u64>(&g_rtm_tx_limit1)));
+		c.jae(fall);
 	});
 
 	// Check pause flag
@@ -1026,6 +1082,8 @@ const extern auto spu_getllar_tx = build_function_asm<u32(*)(u32 raddr, void* rd
 
 	c.xend();
 	c.add(x86::qword_ptr(args[2], ::offset32(&spu_thread::stx)), 1);
+	build_get_tsc(c);
+	c.sub(x86::rax, stamp0);
 
 	// Store data
 	if (s_tsx_avx)
@@ -1047,9 +1105,7 @@ const extern auto spu_getllar_tx = build_function_asm<u32(*)(u32 raddr, void* rd
 		c.movaps(x86::oword_ptr(args[1], 112), x86::xmm7);
 	}
 
-	c.mov(x86::eax, 1);
 	c.jmp(_ret);
-
 	c.bind(fall);
 	c.xor_(x86::eax, x86::eax);
 	//c.jmp(_ret);
@@ -1546,6 +1602,7 @@ void spu_thread::push_snr(u32 number, u32 value)
 	const u32 event_bit = SPU_EVENT_S1 >> (number & 1);
 	const u32 bitor_bit = (snr_config >> number) & 1;
 
+	// Redundant, g_use_rtm is checked inside tx_start now.
 	if (g_use_rtm)
 	{
 		bool channel_notify = false;
@@ -1975,7 +2032,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 				}
 
 				// Obtain range lock as normal store
-				vm::range_lock(res, range_lock, eal, size0);
+				vm::range_lock(range_lock, eal, size0);
 
 				switch (size0)
 				{
@@ -2047,35 +2104,32 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 		perf_meter<"DMA_PUT"_u64> perf2;
 
-		// TODO: split range-locked stores in cache lines for consistency
-		auto& res = vm::reservation_acquire(eal, args.size);
-
 		switch (u32 size = args.size)
 		{
 		case 1:
 		{
-			vm::range_lock(res, range_lock, eal, 1);
+			vm::range_lock(range_lock, eal, 1);
 			*reinterpret_cast<u8*>(dst) = *reinterpret_cast<const u8*>(src);
 			range_lock->release(0);
 			break;
 		}
 		case 2:
 		{
-			vm::range_lock(res, range_lock, eal, 2);
+			vm::range_lock(range_lock, eal, 2);
 			*reinterpret_cast<u16*>(dst) = *reinterpret_cast<const u16*>(src);
 			range_lock->release(0);
 			break;
 		}
 		case 4:
 		{
-			vm::range_lock(res, range_lock, eal, 4);
+			vm::range_lock(range_lock, eal, 4);
 			*reinterpret_cast<u32*>(dst) = *reinterpret_cast<const u32*>(src);
 			range_lock->release(0);
 			break;
 		}
 		case 8:
 		{
-			vm::range_lock(res, range_lock, eal, 8);
+			vm::range_lock(range_lock, eal, 8);
 			*reinterpret_cast<u64*>(dst) = *reinterpret_cast<const u64*>(src);
 			range_lock->release(0);
 			break;
@@ -2084,7 +2138,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 		{
 			if (((eal & 127) + size) <= 128)
 			{
-				vm::range_lock(res, range_lock, eal, size);
+				vm::range_lock(range_lock, eal, size);
 
 				while (size)
 				{
@@ -2110,7 +2164,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 				size -= size0;
 
 				// Split locking + transfer in two parts (before 64K border, and after it)
-				vm::range_lock(res, range_lock, range_addr, size0);
+				vm::range_lock(range_lock, range_addr, size0);
 
 				// Avoid unaligned stores in mov_rdata_avx
 				if (reinterpret_cast<u64>(dst) & 0x10)
@@ -2144,7 +2198,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 				range_addr = nexta;
 			}
 
-			vm::range_lock(res, range_lock, range_addr, range_end - range_addr);
+			vm::range_lock(range_lock, range_addr, range_end - range_addr);
 
 			// Avoid unaligned stores in mov_rdata_avx
 			if (reinterpret_cast<u64>(dst) & 0x10)
@@ -2422,9 +2476,9 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 		if (g_use_rtm) [[likely]]
 		{
-			switch (u32 count = spu_putllc_tx(addr, rtime, rdata, to_write))
+			switch (u64 count = spu_putllc_tx(addr, rtime, rdata, to_write))
 			{
-			case UINT32_MAX:
+			case UINT64_MAX:
 			{
 				auto& data = *vm::get_super_ptr<spu_rdata_t>(addr);
 
@@ -2451,6 +2505,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 					break;
 				}
 
+				last_ftime = -1;
 				[[fallthrough]];
 			}
 			case 0:
@@ -2458,6 +2513,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				if (addr == last_faddr)
 				{
 					last_fail++;
+				}
+
+				if (last_ftime != umax)
+				{
+					last_faddr = 0;
+					return false;
 				}
 
 				_m_prefetchw(rdata);
@@ -2469,9 +2530,9 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			}
 			default:
 			{
-				if (count > 60 && g_cfg.core.perf_report) [[unlikely]]
+				if (count > 20000 && g_cfg.core.perf_report) [[unlikely]]
 				{
-					perf_log.warning("PUTLLC: took too long: %u", count);
+					perf_log.warning(u8"PUTLLC: took too long: %.3fµs (%u c)", count / (utils::get_tsc_freq() / 1000'000.), count);
 				}
 
 				break;
@@ -2503,9 +2564,6 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			// Already locked or updated: give up
 			return false;
 		}
-
-		// Wait for range locks to clear
-		vm::clear_range_locks(addr, 128);
 
 		vm::_ref<atomic_t<u32>>(addr) += 0;
 
@@ -2566,7 +2624,7 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 
 	if (g_use_rtm) [[likely]]
 	{
-		const u32 result = spu_putlluc_tx(addr, to_write, cpu);
+		const u64 result = spu_putlluc_tx(addr, to_write, cpu);
 
 		if (result == 0)
 		{
@@ -2579,9 +2637,9 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 				res += 127;
 			});
 		}
-		else if (result > 60 && g_cfg.core.perf_report) [[unlikely]]
+		else if (result > 20000 && g_cfg.core.perf_report) [[unlikely]]
 		{
-			perf_log.warning("STORE128: took too long: %u", result);
+			perf_log.warning(u8"STORE128: took too long: %.3fµs (%u c)", result / (utils::get_tsc_freq() / 1000'000.), result);
 		}
 
 		static_cast<void>(cpu->test_stopped());
@@ -2796,6 +2854,7 @@ bool spu_thread::process_mfc_cmd()
 		{
 			rtime = last_ftime;
 			raddr = last_faddr;
+			last_ftime = 0;
 			mov_rdata(_ref<spu_rdata_t>(ch_mfc_cmd.lsa & 0x3ff80), rdata);
 
 			ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
