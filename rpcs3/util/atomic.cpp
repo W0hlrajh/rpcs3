@@ -45,24 +45,16 @@ static thread_local bool(*s_tls_wait_cb)(const void* data) = [](const void*){ re
 static thread_local void(*s_tls_notify_cb)(const void* data, u64 progress) = [](const void*, u64){};
 
 // Compare data in memory with old value, and return true if they are equal
-template <bool CheckCb = true, bool CheckData = true>
-static inline bool
+template <bool CheckCb = true>
+static NEVER_INLINE bool
 #ifdef _WIN32
 __vectorcall
 #endif
-ptr_cmp(const void* data, std::size_t size, __m128i old128, __m128i mask128)
+ptr_cmp(const void* data, u32 size, __m128i old128, __m128i mask128)
 {
 	if constexpr (CheckCb)
 	{
 		if (!s_tls_wait_cb(data))
-		{
-			return false;
-		}
-	}
-
-	if constexpr (CheckData)
-	{
-		if (!data)
 		{
 			return false;
 		}
@@ -79,7 +71,7 @@ ptr_cmp(const void* data, std::size_t size, __m128i old128, __m128i mask128)
 	case 8: return (reinterpret_cast<const atomic_t<u64>*>(data)->load() & mask) == (old_value & mask);
 	case 16:
 	{
-		const auto v0 = _mm_load_si128(reinterpret_cast<const __m128i*>(data));
+		const auto v0 = std::bit_cast<__m128i>(atomic_storage<u128>::load(*reinterpret_cast<const u128*>(data)));
 		const auto v1 = _mm_xor_si128(v0, old128);
 		const auto v2 = _mm_and_si128(v1, mask128);
 		const auto v3 = _mm_packs_epi16(v2, v2);
@@ -88,41 +80,134 @@ ptr_cmp(const void* data, std::size_t size, __m128i old128, __m128i mask128)
 		{
 			return true;
 		}
+
+		break;
+	}
+	default:
+	{
+		fprintf(stderr, "ptr_cmp(): bad size (size=%u)" HERE "\n", size);
+		std::abort();
 	}
 	}
 
 	return false;
 }
 
-#ifdef USE_STD
-namespace
+// Returns true if mask overlaps, or the argument is invalid
+static bool
+#ifdef _WIN32
+__vectorcall
+#endif
+cmp_mask(u32 size1, __m128i mask1, __m128i val1, u32 size2, __m128i mask2, __m128i val2)
 {
-	// Standard CV/mutex pair
-	struct cond_handle
-	{
-		std::condition_variable cond;
-		std::mutex mtx;
+	// In force wake up, one of the size arguments is zero
+	const u32 size = std::min(size1, size2);
 
-		cond_handle() noexcept
+	if (!size) [[unlikely]]
+	{
+		return true;
+	}
+
+	// Compare only masks, new value is not available in this mode
+	if ((size1 | size2) == umax)
+	{
+		// Simple mask overlap
+		const auto v0 = _mm_and_si128(mask1, mask2);
+		const auto v1 = _mm_packs_epi16(v0, v0);
+		return _mm_cvtsi128_si64(v1) != 0;
+	}
+
+	// Generate masked value inequality bits
+	const auto v0 = _mm_and_si128(_mm_and_si128(mask1, mask2), _mm_xor_si128(val1, val2));
+
+	if (size <= 8)
+	{
+		// Generate sized mask
+		const u64 mask = UINT64_MAX >> ((64 - size * 8) & 63);
+
+		if (!(_mm_cvtsi128_si64(v0) & mask))
 		{
-			mtx.lock();
+			return false;
 		}
-	};
+	}
+	else if (size == 16)
+	{
+		if (!_mm_cvtsi128_si64(_mm_packs_epi16(v0, v0)))
+		{
+			return false;
+		}
+	}
+	else
+	{
+		fprintf(stderr, "cmp_mask(): bad size (size1=%u, size2=%u)" HERE "\n", size1, size2);
+		std::abort();
+	}
+
+	return true;
 }
 
-// Arbitrary max allowed thread number
-static constexpr u32 s_max_conds = 512 * 64;
+namespace atomic_wait
+{
+	// Essentially a fat semaphore
+	struct alignas(64) cond_handle
+	{
+#ifdef _WIN32
+		u64 tid = GetCurrentThreadId();
+#else
+		u64 tid = reinterpret_cast<u64>(pthread_self());
+#endif
+		atomic_t<u32> sync{};
+		u32 size{};
+		u64 tsc0{};
+		const void* ptr{};
+		__m128i mask{};
+		__m128i oldv{};
 
-static std::aligned_storage_t<sizeof(cond_handle), alignof(cond_handle)> s_cond_list[s_max_conds]{};
+#ifdef USE_STD
+		// Standard CV/mutex pair (often contains pthread_cond_t/pthread_mutex_t)
+		std::condition_variable cond;
+		std::mutex mtx;
+#endif
 
-atomic_t<u64, 64> s_cond_bits[s_max_conds / 64];
+		bool forced_wakeup()
+		{
+			const auto [_old, ok] = sync.fetch_op([](u32& val)
+			{
+				if (val == 1 || val == 2)
+				{
+					val = 3;
+					return true;
+				}
 
-atomic_t<u32, 64> s_cond_sema{0};
+				return false;
+			});
+
+			// Prevent collision between normal wake-up and forced one
+			return ok && _old == 1;
+		}
+	};
+
+#ifndef USE_STD
+	static_assert(sizeof(cond_handle) == 64);
+#endif
+}
+
+// Max allowed thread number is chosen to fit in 16 bits
+static std::aligned_storage_t<sizeof(atomic_wait::cond_handle), alignof(atomic_wait::cond_handle)> s_cond_list[UINT16_MAX]{};
+
+// Used to allow concurrent notifying
+static atomic_t<u16> s_cond_refs[UINT16_MAX + 1]{};
+
+// Allocation bits
+static atomic_t<u64, 64> s_cond_bits[::align<u32>(UINT16_MAX, 64) / 64]{};
+
+// Allocation semaphore
+static atomic_t<u32, 64> s_cond_sema{0};
 
 static u32 cond_alloc()
 {
 	// Determine whether there is a free slot or not
-	if (!s_cond_sema.try_inc(s_max_conds + 1))
+	if (!s_cond_sema.try_inc(UINT16_MAX + 1))
 	{
 		return 0;
 	}
@@ -136,9 +221,9 @@ static u32 cond_alloc()
 	const u32 start = __rdtsc();
 #endif
 
-	for (u32 i = start * 8;; i++)
+	for (u32 i = start;; i++)
 	{
-		const u32 group = i % (s_max_conds / 64);
+		const u32 group = i % ::size32(s_cond_bits);
 
 		const auto [bits, ok] = s_cond_bits[group].fetch_op([](u64& bits)
 		{
@@ -158,22 +243,25 @@ static u32 cond_alloc()
 			const u32 id = group * 64 + std::countr_one(bits);
 
 			// Construct inplace before it can be used
-			new (s_cond_list + id) cond_handle();
+			new (s_cond_list + id) atomic_wait::cond_handle();
+
+			// Add first reference
+			verify(HERE), !s_cond_refs[id]++;
 
 			return id + 1;
 		}
 	}
 
-	// TODO: unreachable
+	// Unreachable
 	std::abort();
 	return 0;
 }
 
-static cond_handle* cond_get(u32 cond_id)
+static atomic_wait::cond_handle* cond_get(u32 cond_id)
 {
-	if (cond_id - 1 < s_max_conds) [[likely]]
+	if (cond_id - 1 < u32{UINT16_MAX}) [[likely]]
 	{
-		return std::launder(reinterpret_cast<cond_handle*>(s_cond_list + (cond_id - 1)));
+		return std::launder(reinterpret_cast<atomic_wait::cond_handle*>(s_cond_list + (cond_id - 1)));
 	}
 
 	return nullptr;
@@ -181,9 +269,15 @@ static cond_handle* cond_get(u32 cond_id)
 
 static void cond_free(u32 cond_id)
 {
-	if (cond_id - 1 >= s_max_conds)
+	if (cond_id - 1 >= u32{UINT16_MAX})
 	{
-		// Ignore bad id because it may contain notifier lock
+		fprintf(stderr, "cond_free(): bad id %u" HERE "\n", cond_id);
+		std::abort();
+	}
+
+	// Dereference, destroy on last ref
+	if (--s_cond_refs[cond_id - 1])
+	{
 		return;
 	}
 
@@ -196,38 +290,71 @@ static void cond_free(u32 cond_id)
 	// Release the semaphore
 	s_cond_sema--;
 }
-#endif
 
-namespace
+static u32 cond_lock(atomic_t<u16>* sema)
 {
-	struct sync_var
+	while (const u32 cond_id = sema->load())
+	{
+		const auto [old, ok] = s_cond_refs[cond_id - 1].fetch_op([](u16& ref)
+		{
+			if (!ref || ref == UINT16_MAX)
+			{
+				// Don't reference already deallocated semaphore
+				return false;
+			}
+
+			ref++;
+			return true;
+		});
+
+		if (ok)
+		{
+			return cond_id;
+		}
+
+		if (old == UINT16_MAX)
+		{
+			fmt::raw_error("Thread limit " STRINGIZE(UINT16_MAX) " for a single address reached in atomic notifier.");
+		}
+
+		if (sema->load() != cond_id)
+		{
+			// Try again if it changed
+			continue;
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	return 0;
+}
+
+namespace atomic_wait
+{
+#define MAX_THREADS (56)
+
+	struct alignas(128) sync_var
 	{
 		constexpr sync_var() noexcept = default;
 
 		// Reference counter, owning pointer, collision bit and optionally selected slot
 		atomic_t<u64> addr_ref{};
 
-		// Allocated semaphore bits (max 60)
+	private:
+		// Semaphores (allocated in reverse order), empty are zeros
+		atomic_t<u16> sema_data[MAX_THREADS]{};
+
+		// Allocated semaphore bits (to make total size 128)
 		atomic_t<u64> sema_bits{};
 
-		// Semaphores (one per thread), data is platform-specific but 0 means empty
-		atomic_t<u32> sema_data[60]{};
-
-		atomic_t<u32>* sema_alloc()
+	public:
+		atomic_t<u16>* sema_alloc()
 		{
-#ifdef USE_STD
-			const u32 cond_id = cond_alloc();
-
-			if (cond_id == 0)
-			{
-				// Too many threads
-				return nullptr;
-			}
-#endif
-
 			const auto [bits, ok] = sema_bits.fetch_op([](u64& bits)
 			{
-				if (bits + 1 < (1ull << 60))
+				if (bits + 1 < (1ull << MAX_THREADS))
 				{
 					// Set lowest clear bit
 					bits |= bits + 1;
@@ -240,73 +367,91 @@ namespace
 			if (ok) [[likely]]
 			{
 				// Find lowest clear bit
-				const auto sema = &sema_data[std::countr_one(bits)];
-
-#if defined(USE_STD)
-				sema->release(cond_id);
-#elif defined(USE_FUTEX)
-				sema->release(1);
-#elif defined(_WIN32)
-				if (NtWaitForAlertByThreadId)
-				{
-					sema->release(GetCurrentThreadId());
-				}
-				else
-				{
-					sema->release(1);
-				}
-#endif
-
-				return sema;
+				return get_sema(std::countr_one(bits));
 			}
 
+			// TODO: support extension if reached
+			fmt::raw_error("Thread limit " STRINGIZE(MAX_THREADS) " for a single address reached in atomic wait.");
 			return nullptr;
 		}
 
-		void sema_free(atomic_t<u32>* sema)
+		atomic_t<u16>* get_sema(u32 id)
+		{
+			verify(HERE), id < MAX_THREADS;
+
+			return &sema_data[(MAX_THREADS - 1) - id];
+		}
+
+		u64 get_sema_bits() const
+		{
+			return sema_bits & ((1ull << MAX_THREADS) - 1);
+		}
+
+		void reset_sema_bit(atomic_t<u16>* sema)
+		{
+			verify(HERE), sema >= sema_data && sema < std::end(sema_data);
+
+			sema_bits &= ~(1ull << ((MAX_THREADS - 1) - (sema - sema_data)));
+		}
+
+		void sema_free(atomic_t<u16>* sema)
 		{
 			if (sema < sema_data || sema >= std::end(sema_data))
 			{
+				fprintf(stderr, "sema_free(): bad sema ptr %p" HERE "\n", sema);
 				std::abort();
 			}
 
-			// Clear sema
-#ifdef USE_STD
+			// Try to deallocate semaphore (may be delegated to a notifier)
 			cond_free(sema->exchange(0));
-#else
-			sema->release(0);
-#endif
+
 			// Clear sema bit
-			sema_bits &= ~(1ull << (sema - sema_data));
+			reset_sema_bit(sema);
 		}
 	};
+
+	static_assert(sizeof(sync_var) == 128);
+
+#undef MAX_THREADS
 }
 
 // Main hashtable for atomic wait.
-alignas(64) static sync_var s_hashtable[s_hashtable_size]{};
+alignas(128) static atomic_wait::sync_var s_hashtable[s_hashtable_size]{};
 
-namespace
+namespace atomic_wait
 {
 	struct slot_info
 	{
 		constexpr slot_info() noexcept = default;
 
 		// Branch extension
-		sync_var branch[48 - s_hashtable_power]{};
+		atomic_wait::sync_var branch[48 - s_hashtable_power]{};
 	};
 }
 
 // Number of search groups (defines max slot branch count as gcount * 64)
-static constexpr u32 s_slot_gcount = (s_hashtable_power > 7 ? 4096 : 256) / 64;
+#define MAX_SLOTS (4096)
 
 // Array of slot branch objects
-alignas(64) static slot_info s_slot_list[s_slot_gcount * 64]{};
+alignas(128) static atomic_wait::slot_info s_slot_list[MAX_SLOTS]{};
 
 // Allocation bits
-static atomic_t<u64, 64> s_slot_bits[s_slot_gcount]{};
+static atomic_t<u64, 64> s_slot_bits[MAX_SLOTS / 64]{};
+
+// Allocation semaphore
+static atomic_t<u32, 64> s_slot_sema{0};
+
+static_assert(MAX_SLOTS % 64 == 0);
 
 static u64 slot_alloc()
 {
+	// Determine whether there is a free slot or not
+	if (!s_slot_sema.try_inc(MAX_SLOTS + 1))
+	{
+		fmt::raw_error("Hashtable extension slot limit " STRINGIZE(MAX_SLOTS) " reached in atomic wait.");
+		return 0;
+	}
+
 	// Diversify search start points to reduce contention and increase immediate success chance
 #ifdef _WIN32
 	const u32 start = GetCurrentProcessorNumber();
@@ -316,9 +461,9 @@ static u64 slot_alloc()
 	const u32 start = __rdtsc();
 #endif
 
-	for (u32 i = 0;; i++)
+	for (u32 i = start;; i++)
 	{
-		const u32 group = (i + start * 8) % s_slot_gcount;
+		const u32 group = i % ::size32(s_slot_bits);
 
 		const auto [bits, ok] = s_slot_bits[group].fetch_op([](u64& bits)
 		{
@@ -339,12 +484,14 @@ static u64 slot_alloc()
 		}
 	}
 
-	// TODO: unreachable
+	// Unreachable
 	std::abort();
 	return 0;
 }
 
-static sync_var* slot_get(std::uintptr_t iptr, sync_var* loc, u64 lv = 0)
+#undef MAX_SLOTS
+
+static atomic_wait::sync_var* slot_get(std::uintptr_t iptr, atomic_wait::sync_var* loc, u64 lv = 0)
 {
 	if (!loc)
 	{
@@ -380,18 +527,19 @@ static void slot_free(u64 id)
 	// Reset allocation bit
 	id = (id & s_slot_mask) / one_v<s_slot_mask>;
 	s_slot_bits[id / 64] &= ~(1ull << (id % 64));
+
+	// Reset semaphore
+	s_slot_sema--;
 }
 
-static void slot_free(std::uintptr_t iptr, sync_var* loc, u64 lv = 0)
+static void slot_free(std::uintptr_t iptr, atomic_wait::sync_var* loc, u64 lv = 0)
 {
 	const u64 value = loc->addr_ref.load();
 
 	if ((value & s_pointer_mask) != (iptr & s_pointer_mask))
 	{
-		if ((value & s_waiter_mask) == 0 || (value & s_collision_bit) == 0)
-		{
-			std::abort();
-		}
+		ASSERT(value & s_waiter_mask);
+		ASSERT(value & s_collision_bit);
 
 		// Get the number of leading equal bits to determine subslot
 		const u64 eq_bits = std::countl_zero<u64>((((iptr ^ value) & (s_pointer_mask >> lv)) | ~s_pointer_mask) << 16);
@@ -403,7 +551,7 @@ static void slot_free(std::uintptr_t iptr, sync_var* loc, u64 lv = 0)
 	// Actual cleanup in reverse order
 	auto [_old, ok] = loc->addr_ref.fetch_op([&](u64& value)
 	{
-		if (value & s_waiter_mask)
+		ASSERT(value & s_waiter_mask);
 		{
 			value -= one_v<s_waiter_mask>;
 
@@ -416,15 +564,10 @@ static void slot_free(std::uintptr_t iptr, sync_var* loc, u64 lv = 0)
 
 			return 1;
 		}
-
-		std::abort();
 	});
 
 	if (ok > 1 && _old & s_collision_bit)
 	{
-		if (loc->sema_bits)
-			std::abort();
-
 		// Deallocate slot on last waiter
 		slot_free(_old);
 	}
@@ -434,7 +577,7 @@ SAFE_BUFFERS void
 #ifdef _WIN32
 __vectorcall
 #endif
-atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value, u64 timeout, __m128i mask)
+atomic_wait_engine::wait(const void* data, u32 size, __m128i old_value, u64 timeout, __m128i mask)
 {
 	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data);
 
@@ -442,7 +585,7 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 	u64 slot_a = -1;
 
 	// Found slot object
-	sync_var* slot = nullptr;
+	atomic_wait::sync_var* slot = nullptr;
 
 	auto install_op = [&](u64& value) -> u64
 	{
@@ -482,7 +625,7 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 	// Search detail
 	u64 lv = 0;
 
-	for (sync_var* ptr = &s_hashtable[iptr % s_hashtable_size];;)
+	for (atomic_wait::sync_var* ptr = &s_hashtable[iptr % s_hashtable_size];;)
 	{
 		auto [_old, ok] = ptr->addr_ref.fetch_op(install_op);
 
@@ -531,10 +674,12 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 		lv = eq_bits + 1;
 	}
 
-#ifdef _WIN32
-	// May be used by NtWaitForAlertByThreadId
-	u32 thread_id[16]{GetCurrentThreadId()};
-#endif
+	const u32 cond_id = cond_alloc();
+
+	if (cond_id == 0)
+	{
+		fmt::raw_error("Thread limit " STRINGIZE(UINT16_MAX) " reached in atomic wait.");
+	}
 
 	auto sema = slot->sema_alloc();
 
@@ -542,6 +687,7 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 	{
 		if (timeout + 1 || ptr_cmp<false>(data, size, old_value, mask))
 		{
+			cond_free(cond_id);
 			slot_free(iptr, &s_hashtable[iptr % s_hashtable_size]);
 			return;
 		}
@@ -551,9 +697,22 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 		sema = slot->sema_alloc();
 	}
 
+	// Save for notifiers
+	const auto cond = cond_get(cond_id);
+
+	// Store some info for notifiers (some may be unused)
+	cond->size = size;
+	cond->mask = mask;
+	cond->oldv = old_value;
+	cond->ptr  = data;
+	cond->tsc0 = __rdtsc();
+
+	cond->sync = 1;
+	sema->store(static_cast<u16>(cond_id));
+
 #ifdef USE_STD
-	// Create mutex for condition variable (already locked)
-	std::unique_lock lock(cond_get(sema->load() & 0x7fffffff)->mtx, std::adopt_lock);
+	// Lock mutex
+	std::unique_lock lock(cond->mtx);
 #endif
 
 	// Can skip unqueue process if true
@@ -570,33 +729,34 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 		ts.tv_sec  = timeout / 1'000'000'000;
 		ts.tv_nsec = timeout % 1'000'000'000;
 
-		if (sema->load() > 1) [[unlikely]]
+		if (cond->sync.load() > 1) [[unlikely]]
 		{
 			// Signaled prematurely
-			sema->release(1);
-		}
-		else
-		{
-			futex(sema, FUTEX_WAIT_PRIVATE, 1, timeout + 1 ? &ts : nullptr);
-		}
-#elif defined(USE_STD)
-		const u32 val = sema->load();
-
-		if (val >> 31)
-		{
-			// Locked by notifier
-			if (!ptr_cmp(data, size, old_value, mask))
+			if (cond->sync.load() == 3 || !cond->sync.compare_and_swap_test(2, 1))
 			{
 				break;
 			}
 		}
-		else if (timeout + 1)
+		else
 		{
-			cond_get(val)->cond.wait_for(lock, std::chrono::nanoseconds(timeout));
+			futex(&cond->sync, FUTEX_WAIT_PRIVATE, 1, timeout + 1 ? &ts : nullptr);
+		}
+#elif defined(USE_STD)
+		if (cond->sync.load() > 1) [[unlikely]]
+		{
+			if (cond->sync.load() == 3 || !cond->sync.compare_and_swap_test(2, 1))
+			{
+				break;
+			}
+		}
+
+		if (timeout + 1)
+		{
+			cond->cond.wait_for(lock, std::chrono::nanoseconds(timeout));
 		}
 		else
 		{
-			cond_get(val)->cond.wait(lock);
+			cond->cond.wait(lock);
 		}
 #elif defined(_WIN32)
 		LARGE_INTEGER qw;
@@ -608,21 +768,20 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 			qw.QuadPart -= 1;
 		}
 
-		if (NtWaitForAlertByThreadId)
+		if (fallback) [[unlikely]]
 		{
-			if (fallback) [[unlikely]]
+			if (cond->sync.load() == 3 || !cond->sync.compare_and_swap_test(2, 1))
 			{
-				// Restart waiting
-				if (sema->load() == umax)
-				{
-					sema->release(thread_id[0]);
-				}
-
 				fallback = false;
+				break;
 			}
 
-			// Let's assume it can return spuriously
-			switch (DWORD status = NtWaitForAlertByThreadId(thread_id, timeout + 1 ? &qw : nullptr))
+			fallback = false;
+		}
+
+		if (NtWaitForAlertByThreadId)
+		{
+			switch (DWORD status = NtWaitForAlertByThreadId(cond, timeout + 1 ? &qw : nullptr))
 			{
 			case NTSTATUS_ALERTED: fallback = true; break;
 			case NTSTATUS_TIMEOUT: break;
@@ -635,15 +794,7 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 		}
 		else
 		{
-			if (fallback)
-			{
-				// Restart waiting
-				verify(HERE), sema->load() == 2;
-				sema->release(1);
-				fallback = false;
-			}
-
-			if (!NtWaitForKeyedEvent(nullptr, sema, false, timeout + 1 ? &qw : nullptr))
+			if (NtWaitForKeyedEvent(nullptr, sema, false, timeout + 1 ? &qw : nullptr) == NTSTATUS_SUCCESS)
 			{
 				// Error code assumed to be timeout
 				fallback = true;
@@ -663,14 +814,15 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 #if defined(_WIN32)
 		static LARGE_INTEGER instant{};
 
+		if (cond->sync.compare_and_swap_test(1, 2))
+		{
+			// Succeeded in self-notifying
+			break;
+		}
+
 		if (NtWaitForAlertByThreadId)
 		{
-			if (sema->compare_and_swap_test(thread_id[0], -1))
-			{
-				break;
-			}
-
-			if (NtWaitForAlertByThreadId(thread_id, &instant) == NTSTATUS_ALERTED)
+			if (NtWaitForAlertByThreadId(cond, &instant) == NTSTATUS_ALERTED)
 			{
 				break;
 			}
@@ -678,26 +830,21 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 			continue;
 		}
 
-		if (sema->compare_and_swap_test(1, 2))
-		{
-			// Succeeded in self-notifying
-			break;
-		}
-
 		if (!NtWaitForKeyedEvent(nullptr, sema, false, &instant))
 		{
 			// Succeeded in obtaining an event without waiting
 			break;
 		}
+
+		continue;
 #endif
 	}
 
-#ifdef _WIN32
-	verify(HERE), thread_id[0] == GetCurrentThreadId();
-#endif
-
 #ifdef USE_STD
-	lock.unlock();
+	if (lock)
+	{
+		lock.unlock();
+	}
 #endif
 
 	slot->sema_free(sema);
@@ -708,108 +855,60 @@ atomic_storage_futex::wait(const void* data, std::size_t size, __m128i old_value
 }
 
 // Platform specific wake-up function
-static inline bool alert_sema(atomic_t<u32>* sema, const void* data, u64 progress)
+static NEVER_INLINE bool
+#ifdef _WIN32
+__vectorcall
+#endif
+alert_sema(atomic_t<u16>* sema, const void* data, u64 info, u32 size, __m128i mask, __m128i new_value)
 {
-#ifdef USE_FUTEX
-	if (sema->load() == 1 && sema->compare_and_swap_test(1, 2))
+	const u32 cond_id = cond_lock(sema);
+
+	if (!cond_id)
 	{
-		if (!progress)
-		{
-			// Imminent notification
-			s_tls_notify_cb(data, 0);
-		}
-
-		// Use "wake all" arg for robustness, only 1 thread is expected
-		futex(sema, FUTEX_WAKE_PRIVATE, 0x7fff'ffff);
-		return true;
-	}
-#elif defined(USE_STD)
-	// Check if not zero and not locked
-	u32 old_val = sema->load();
-
-	if (((old_val - 1) >> 31) == 0)
-	{
-		const auto [cond_id, ok] = sema->fetch_op([](u32& id)
-		{
-			if ((id - 1) >> 31)
-			{
-				return false;
-			}
-
-			// Set notify lock
-			id |= 1u << 31;
-			return true;
-		});
-
-		if (ok)
-		{
-			if (auto cond = cond_get(cond_id))
-			{
-				if (!progress)
-				{
-					// Imminent notification
-					s_tls_notify_cb(data, 0);
-				}
-
-				// Not super efficient: locking is required to avoid lost notifications
-				cond->mtx.lock();
-				cond->mtx.unlock();
-				cond->cond.notify_all();
-
-				// Try to remove notifier lock gracefully
-				if (!sema->compare_and_swap_test(cond_id | (1u << 31), cond_id)) [[unlikely]]
-				{
-					// Cleanup helping
-					cond_free(cond_id);
-					return false;
-				}
-
-				return true;
-			}
-		}
-	}
-#elif defined(_WIN32)
-	if (NtWaitForAlertByThreadId)
-	{
-		u32 tid = sema->load();
-
-		// Check if tid is neither 0 nor -1
-		if (tid + 1 > 1 && sema->compare_and_swap_test(tid, -1))
-		{
-			if (!progress)
-			{
-				// Imminent notification
-				s_tls_notify_cb(data, 0);
-			}
-
-			if (NtAlertThreadByThreadId(tid) == NTSTATUS_SUCCESS)
-			{
-				// Could be some dead thread otherwise
-				return true;
-			}
-		}
-
 		return false;
 	}
 
-	if (sema->load() == 1 && sema->compare_and_swap_test(1, 2))
+	const auto cond = cond_get(cond_id);
+
+	verify(HERE), cond;
+
+	bool ok = false;
+
+	if (cond->sync && (!size ? (!info || cond->tid == info) : cond->ptr == data && cmp_mask(size, mask, new_value, cond->size, cond->mask, cond->oldv)))
 	{
-		if (!progress)
+		if ((!size && cond->forced_wakeup()) || (size && cond->sync.load() == 1 && cond->sync.compare_and_swap_test(1, 2)))
 		{
-			// Imminent notification
-			s_tls_notify_cb(data, 0);
-		}
+			ok = true;
 
-		// Can wait in rare cases, which is its annoying weakness
-		NtReleaseKeyedEvent(nullptr, sema, 1, nullptr);
-		return true;
-	}
+#ifdef USE_FUTEX
+			// Use "wake all" arg for robustness, only 1 thread is expected
+			futex(&cond->sync, FUTEX_WAKE_PRIVATE, 0x7fff'ffff);
+#elif defined(USE_STD)
+			// Not super efficient: locking is required to avoid lost notifications
+			cond->mtx.lock();
+			cond->mtx.unlock();
+			cond->cond.notify_all();
+#elif defined(_WIN32)
+			if (NtWaitForAlertByThreadId)
+			{
+				// Sets some sticky alert bit, at least I believe so
+				NtAlertThreadByThreadId(cond->tid);
+			}
+			else
+			{
+				// Can wait in rare cases, which is its annoying weakness
+				NtReleaseKeyedEvent(nullptr, sema, 1, nullptr);
+			}
 #endif
+		}
+	}
 
-	return false;
+	// Remove lock, possibly deallocate cond
+	cond_free(cond_id);
+	return ok;
 }
 
-void atomic_storage_futex::set_wait_callback(bool(*cb)(const void* data))
+void atomic_wait_engine::set_wait_callback(bool(*cb)(const void* data))
 {
 	if (cb)
 	{
@@ -821,7 +920,7 @@ void atomic_storage_futex::set_wait_callback(bool(*cb)(const void* data))
 	}
 }
 
-void atomic_storage_futex::set_notify_callback(void(*cb)(const void*, u64))
+void atomic_wait_engine::set_notify_callback(void(*cb)(const void*, u64))
 {
 	if (cb)
 	{
@@ -833,15 +932,49 @@ void atomic_storage_futex::set_notify_callback(void(*cb)(const void*, u64))
 	}
 }
 
-void atomic_storage_futex::raw_notify(const void* data)
+bool atomic_wait_engine::raw_notify(const void* data, u64 thread_id)
 {
-	if (data)
+	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data);
+
+	const auto slot = slot_get(iptr, &s_hashtable[(iptr) % s_hashtable_size]);
+
+	if (!slot)
 	{
-		notify_all(data);
+		return false;
 	}
+
+	s_tls_notify_cb(data, 0);
+
+	u64 progress = 0;
+
+	for (u64 bits = slot->get_sema_bits(); bits; bits &= bits - 1)
+	{
+		const auto sema = slot->get_sema(std::countr_zero(bits));
+
+		// Forced notification
+		if (alert_sema(sema, data, thread_id, 0, _mm_setzero_si128(), _mm_setzero_si128()))
+		{
+			s_tls_notify_cb(data, ++progress);
+
+			if (thread_id == 0)
+			{
+				// Works like notify_all in this case
+				continue;
+			}
+
+			break;
+		}
+	}
+
+	s_tls_notify_cb(data, -1);
+	return progress != 0;
 }
 
-void atomic_storage_futex::notify_one(const void* data)
+void
+#ifdef _WIN32
+__vectorcall
+#endif
+atomic_wait_engine::notify_one(const void* data, u32 size, __m128i mask, __m128i new_value)
 {
 	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data);
 
@@ -852,13 +985,15 @@ void atomic_storage_futex::notify_one(const void* data)
 		return;
 	}
 
+	s_tls_notify_cb(data, 0);
+
 	u64 progress = 0;
 
-	for (u64 bits = slot->sema_bits; bits; bits &= bits - 1)
+	for (u64 bits = slot->get_sema_bits(); bits; bits &= bits - 1)
 	{
-		const auto sema = &slot->sema_data[std::countr_zero(bits)];
+		const auto sema = slot->get_sema(std::countr_zero(bits));
 
-		if (alert_sema(sema, data, progress))
+		if (alert_sema(sema, data, progress, size, mask, new_value))
 		{
 			s_tls_notify_cb(data, ++progress);
 			break;
@@ -868,7 +1003,11 @@ void atomic_storage_futex::notify_one(const void* data)
 	s_tls_notify_cb(data, -1);
 }
 
-void atomic_storage_futex::notify_all(const void* data)
+SAFE_BUFFERS void
+#ifdef _WIN32
+__vectorcall
+#endif
+atomic_wait_engine::notify_all(const void* data, u32 size, __m128i mask, __m128i new_value)
 {
 	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data);
 
@@ -879,33 +1018,39 @@ void atomic_storage_futex::notify_all(const void* data)
 		return;
 	}
 
-	u64 progress = 0;
+	s_tls_notify_cb(data, 0);
 
-#if defined(_WIN32) && !defined(USE_FUTEX)
-	if (!NtAlertThreadByThreadId)
+	u64 progress = 0;
 	{
 		// Make a copy to filter out waiters that fail some checks
-		u64 copy = slot->sema_bits.load();
-
-		// Used for making non-blocking syscall
-		static LARGE_INTEGER instant{};
+		u64 copy = slot->get_sema_bits();
+		u64 lock = 0;
+		u32 lock_ids[64]{};
 
 		for (u64 bits = copy; bits; bits &= bits - 1)
 		{
 			const u32 id = std::countr_zero(bits);
 
-			const auto sema = &slot->sema_data[id];
+			const auto sema = slot->get_sema(id);
 
-			if (sema->load() == 1 && sema->compare_and_swap_test(1, 2))
+			if (const u32 cond_id = cond_lock(sema))
 			{
-				// Waiters locked for notification
-				if (bits == copy)
-				{
-					// Notify imminent notification
-					s_tls_notify_cb(data, 0);
-				}
+				// Add lock bit for cleanup
+				lock |= 1ull << id;
+				lock_ids[id] = cond_id;
 
-				continue;
+				const auto cond = cond_get(cond_id);
+
+				verify(HERE), cond;
+
+				if (cond->sync && cond->ptr == data && cmp_mask(size, mask, new_value, cond->size, cond->mask, cond->oldv))
+				{
+					if (cond->sync.load() == 1 && cond->sync.compare_and_swap_test(1, 2))
+					{
+						// Ok.
+						continue;
+					}
+				}
 			}
 
 			// Remove the bit from next stage
@@ -919,14 +1064,36 @@ void atomic_storage_futex::notify_all(const void* data)
 			{
 				const u32 id = std::countr_zero(bits);
 
-				const auto sema = &slot->sema_data[id];
+				const auto sema = slot->get_sema(id);
+				const auto cond = cond_get(lock_ids[id]);
 
-				if (NtReleaseKeyedEvent(nullptr, sema, 1, &instant))
+#if defined(USE_FUTEX)
+				continue;
+#elif defined(USE_STD)
+				// Optimistic non-blocking path
+				if (cond->mtx.try_lock())
+				{
+					cond->mtx.unlock();
+					cond->cond.notify_all();
+				}
+				else
+				{
+					continue;
+				}
+#elif defined(_WIN32)
+				if (NtAlertThreadByThreadId)
+				{
+					continue;
+				}
+
+				static LARGE_INTEGER instant{};
+
+				if (NtReleaseKeyedEvent(nullptr, sema, 1, &instant) != NTSTATUS_SUCCESS)
 				{
 					// Failed to notify immediately
 					continue;
 				}
-
+#endif
 				s_tls_notify_cb(data, ++progress);
 
 				// Remove the bit from next stage
@@ -937,20 +1104,47 @@ void atomic_storage_futex::notify_all(const void* data)
 		// Proceed with remaining bits using "normal" blocking waiting
 		for (u64 bits = copy; bits; bits &= bits - 1)
 		{
-			NtReleaseKeyedEvent(nullptr, &slot->sema_data[std::countr_zero(bits)], 1, nullptr);
+			const u32 id = std::countr_zero(bits);
+
+			const auto sema = slot->get_sema(id);
+			const auto cond = cond_get(lock_ids[id]);
+
+#if defined(USE_FUTEX)
+			// Always alerted (result isn't meaningful here)
+			futex(&cond->sync, FUTEX_WAKE_PRIVATE, 0x7fff'ffff);
+#elif defined(USE_STD)
+			cond->mtx.lock();
+			cond->mtx.unlock();
+			cond->cond.notify_all();
+#elif defined(_WIN32)
+			if (NtAlertThreadByThreadId)
+			{
+				NtAlertThreadByThreadId(cond->tid);
+			}
+			else
+			{
+				NtReleaseKeyedEvent(nullptr, sema, 1, nullptr);
+			}
+#endif
 			s_tls_notify_cb(data, ++progress);
+		}
+
+		// Cleanup locked notifiers
+		for (u64 bits = lock; bits; bits &= bits - 1)
+		{
+			cond_free(lock_ids[std::countr_zero(bits)]);
 		}
 
 		s_tls_notify_cb(data, -1);
 		return;
 	}
-#endif
 
-	for (u64 bits = slot->sema_bits.load(); bits; bits &= bits - 1)
+	// Unused, let's keep for reference
+	for (u64 bits = slot->get_sema_bits(); bits; bits &= bits - 1)
 	{
-		const auto sema = &slot->sema_data[std::countr_zero(bits)];
+		const auto sema = slot->get_sema(std::countr_zero(bits));
 
-		if (alert_sema(sema, data, progress))
+		if (alert_sema(sema, data, progress, size, mask, new_value))
 		{
 			s_tls_notify_cb(data, ++progress);
 			continue;

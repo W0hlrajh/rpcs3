@@ -24,8 +24,7 @@ namespace vm
 
 		range_normal = 3ull << 32, // R+W, testing as mask for zero can check no access
 		range_locked = 2ull << 32, // R+W as well, the only range flag that should block by address
-		range_sharing = 6ull << 32, // Range being registered as shared, flags are unchanged
-		range_allocation = 0, // Allocation, no safe access
+		range_allocation = 0, // Allocation, no safe access, g_shareable may change at ANY location
 	};
 
 	extern atomic_t<u64> g_range_lock;
@@ -44,6 +43,10 @@ namespace vm
 	FORCE_INLINE void range_lock(atomic_t<u64, 64>* range_lock, u32 begin, u32 size)
 	{
 		const u64 lock_val = g_range_lock.load();
+		#ifndef _MSC_VER
+		__asm__(""); // Tiny barrier
+		#endif
+		const u64 is_shared = g_shareable[begin >> 16].load();
 		const u64 lock_addr = static_cast<u32>(lock_val); // -> u64
 		const u32 lock_size = static_cast<u32>(lock_val >> 35);
 
@@ -51,24 +54,25 @@ namespace vm
 
 		// Optimization: if range_locked is not used, the addr check will always pass
 		// Otherwise, g_shareable is unchanged and its value is reliable to read
-		if (g_shareable[begin >> 16] | (((lock_val >> 32) & (range_full_mask >> 32)) ^ (range_locked >> 32)))
+		if (is_shared)
 		{
 			addr = addr & 0xffff;
 		}
 
-		if (addr + size <= lock_addr || addr >= lock_addr + lock_size) [[likely]]
+		if (addr + size <= lock_addr || addr >= lock_addr + lock_size || ((lock_val >> 32) ^ (range_locked >> 32)) & (range_full_mask >> 32)) [[likely]]
 		{
-			// Optimistic locking
+			// Optimistic locking.
+			// Note that we store the range we will be accessing, without any clamping.
 			range_lock->store(begin | (u64{size} << 32));
 
 			const u64 new_lock_val = g_range_lock.load();
 
-			if (!(new_lock_val | (new_lock_val != lock_val))) [[likely]]
+			if (!new_lock_val || new_lock_val == lock_val) [[likely]]
 			{
 				return;
 			}
 
-			range_lock->release(0);
+			range_lock->store(0);
 		}
 
 		// Fallback to slow path
