@@ -17,9 +17,141 @@ enum class atomic_wait_timeout : u64
 // Unused externally
 namespace atomic_wait
 {
+	constexpr uint max_list = 8;
+
 	struct sync_var;
 	struct slot_info;
 	struct sema_handle;
+
+	struct info
+	{
+		const void* data;
+		u32 size;
+		__m128i old;
+		__m128i mask;
+
+		template <typename T>
+		constexpr void set_value(T value)
+		{
+			static_assert((sizeof(T) & (sizeof(T) - 1)) == 0);
+			static_assert(sizeof(T) <= 16);
+
+			if constexpr (sizeof(T) <= 8)
+			{
+				old = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>, T>(value));
+			}
+			else if constexpr (sizeof(T) == 16)
+			{
+				old = std::bit_cast<__m128i>(value);
+			}
+		}
+
+		void set_value()
+		{
+			old = _mm_setzero_si128();
+		}
+
+		template <typename T>
+		constexpr void set_mask(T value)
+		{
+			static_assert((sizeof(T) & (sizeof(T) - 1)) == 0);
+			static_assert(sizeof(T) <= 16);
+
+			if constexpr (sizeof(T) <= 8)
+			{
+				mask = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>, T>(value));
+			}
+			else if constexpr (sizeof(T) == 16)
+			{
+				mask = std::bit_cast<__m128i>(value);
+			}
+		}
+
+		void set_mask()
+		{
+			mask = _mm_set1_epi64x(-1);
+		}
+	};
+
+	template <uint Max, typename... T>
+	class list
+	{
+		static_assert(Max <= max_list, "Too many elements in the atomic wait list.");
+
+		// Null-terminated list of wait info
+		info m_info[Max + 1]{};
+
+	public:
+		constexpr list() noexcept = default;
+
+		constexpr list(const list&) noexcept = default;
+
+		constexpr list& operator=(const list&) noexcept = default;
+
+		template <typename... U, std::size_t... Align>
+		constexpr list(atomic_t<U, Align>&... vars)
+			: m_info{{&vars.raw(), sizeof(U), _mm_setzero_si128(), _mm_set1_epi64x(-1)}...}
+		{
+			static_assert(sizeof...(U) <= Max);
+		}
+
+		template <typename... U>
+		constexpr list& values(U... values)
+		{
+			static_assert(sizeof...(U) <= Max);
+
+			auto* ptr = m_info;
+			((ptr++)->template set_value<T>(values), ...);
+			return *this;
+		}
+
+		template <typename... U>
+		constexpr list& masks(T... masks)
+		{
+			static_assert(sizeof...(U) <= Max);
+
+			auto* ptr = m_info;
+			((ptr++)->template set_mask<T>(masks), ...);
+			return *this;
+		}
+
+		template <uint Index, typename T2, std::size_t Align, typename U>
+		constexpr void set(atomic_t<T2, Align>& var, U value)
+		{
+			static_assert(Index < Max);
+
+			m_info[Index].data = &var.raw();
+			m_info[Index].size = sizeof(T2);
+			m_info[Index].template set_value<T2>(value);
+			m_info[Index].mask = _mm_set1_epi64x(-1);
+		}
+
+		template <uint Index, typename T2, std::size_t Align, typename U, typename V>
+		constexpr void set(atomic_t<T2, Align>& var, U value, V mask)
+		{
+			static_assert(Index < Max);
+
+			m_info[Index].data = &var.raw();
+			m_info[Index].size = sizeof(T2);
+			m_info[Index].template set_value<T2>(value);
+			m_info[Index].template set_mask<T2>(mask);
+		}
+
+		// Timeout is discouraged
+		void wait(atomic_wait_timeout timeout = atomic_wait_timeout::inf);
+
+		// Same as wait
+		void start()
+		{
+			wait();
+		}
+	};
+
+	template <typename... T, std::size_t... Align>
+	list(atomic_t<T, Align>&... vars) -> list<sizeof...(T), T...>;
+
+	// RDTSC with adjustment for being unique
+	u64 get_unique_tsc();
 }
 
 // Helper for waitable atomics (as in C++20 std::atomic)
@@ -29,11 +161,14 @@ private:
 	template <typename T, std::size_t Align>
 	friend class atomic_t;
 
+	template <uint Max, typename... T>
+	friend class atomic_wait::list;
+
 	static void
 #ifdef _WIN32
 	__vectorcall
 #endif
-	wait(const void* data, u32 size, __m128i old128, u64 timeout, __m128i mask128);
+	wait(const void* data, u32 size, __m128i old128, u64 timeout, __m128i mask128, atomic_wait::info* extension = nullptr);
 
 	static void
 #ifdef _WIN32
@@ -52,6 +187,14 @@ public:
 	static void set_notify_callback(void(*cb)(const void* data, u64 progress));
 	static bool raw_notify(const void* data, u64 thread_id = 0);
 };
+
+template <uint Max, typename... T>
+void atomic_wait::list<Max, T...>::wait(atomic_wait_timeout timeout)
+{
+	static_assert(Max, "Cannot initiate atomic wait with empty list.");
+
+	atomic_wait_engine::wait(m_info[0].data, m_info[0].size, m_info[0].old, static_cast<u64>(timeout), m_info[0].mask, m_info + 1);
+}
 
 // Helper class, provides access to compiler-specific atomic intrinsics
 template <typename T, std::size_t Size = sizeof(T)>
@@ -1350,465 +1493,3 @@ public:
 		}
 	}
 };
-
-template <typename T, unsigned BitWidth = 0>
-class atomic_with_lock_bit
-{
-	// Simply internal type
-	using type = std::conditional_t<std::is_pointer_v<T>, std::uintptr_t, T>;
-
-	// Used for pointer arithmetics
-	using ptr_rt = std::conditional_t<std::is_pointer_v<T>, ullong, T>;
-
-	static constexpr auto c_lock_bit = BitWidth + 1;
-	static constexpr auto c_dirty = type{1} << BitWidth;
-
-	// Check space for lock bit
-	static_assert(BitWidth <= sizeof(T) * 8 - 2, "No space for lock bit");
-	static_assert(sizeof(T) <= 8 || (!std::is_pointer_v<T> && !std::is_integral_v<T>), "Not supported");
-	static_assert(!std::is_same_v<std::decay_t<T>, bool>, "Bool not supported, use integral with size 1.");
-	static_assert(std::is_pointer_v<T> == (BitWidth == 0), "BitWidth should be 0 for pointers");
-	static_assert(!std::is_pointer_v<T> || (alignof(std::remove_pointer_t<T>) >= 4), "Pointer type should have align 4 or more");
-
-	atomic_t<type> m_data;
-
-public:
-	using base_type = T;
-
-	static bool is_locked(type old_val)
-	{
-		if constexpr (std::is_signed_v<type> && BitWidth == sizeof(T) * 8 - 2)
-		{
-			return old_val < 0;
-		}
-		else if constexpr (std::is_pointer_v<T>)
-		{
-			return (old_val & 2) != 0;
-		}
-		else
-		{
-			return (old_val & (type{2} << BitWidth)) != 0;
-		}
-	}
-
-	static type clamp_value(type old_val)
-	{
-		if constexpr (std::is_pointer_v<T>)
-		{
-			return old_val & (~type{0} << 2);
-		}
-		else
-		{
-			return old_val & ((type{1} << BitWidth) - type{1});
-		}
-	}
-
-	// Define simple type
-	using simple_type = simple_t<T>;
-
-	atomic_with_lock_bit() noexcept = default;
-
-	atomic_with_lock_bit(const atomic_with_lock_bit&) = delete;
-
-	atomic_with_lock_bit& operator =(const atomic_with_lock_bit&) = delete;
-
-	constexpr atomic_with_lock_bit(T value) noexcept
-		: m_data(clamp_value(reinterpret_cast<type>(value)))
-	{
-	}
-
-	// Unsafe read
-	type raw_load() const
-	{
-		return clamp_value(m_data.load());
-	}
-
-	// Unsafe write and unlock
-	void raw_release(type value)
-	{
-		m_data.release(clamp_value(value));
-
-		// TODO: test dirty bit for notification
-		if (true)
-		{
-			m_data.notify_all();
-		}
-	}
-
-	void lock()
-	{
-		while (m_data.bts(c_lock_bit)) [[unlikely]]
-		{
-			type old_val = m_data.load();
-
-			if (is_locked(old_val)) [[likely]]
-			{
-				if ((old_val & c_dirty) == 0)
-				{
-					// Try to set dirty bit if not set already
-					if (!m_data.compare_and_swap_test(old_val, old_val | c_dirty))
-					{
-						continue;
-					}
-				}
-
-				m_data.wait(old_val | c_dirty);
-				old_val = m_data.load();
-			}
-		}
-	}
-
-	bool try_lock()
-	{
-		return !m_data.bts(c_lock_bit);
-	}
-
-	void unlock()
-	{
-		type old_val = m_data.load();
-
-		if constexpr (std::is_pointer_v<T>)
-		{
-			m_data.and_fetch(~type{0} << 2);
-		}
-		else
-		{
-			m_data.and_fetch((type{1} << BitWidth) - type{1});
-		}
-
-		// Test dirty bit for notification
-		if (old_val & c_dirty)
-		{
-			m_data.notify_all();
-		}
-	}
-
-	T load()
-	{
-		type old_val = m_data.load();
-
-		while (is_locked(old_val)) [[unlikely]]
-		{
-			if ((old_val & c_dirty) == 0)
-			{
-				if (!m_data.compare_and_swap_test(old_val, old_val | c_dirty))
-				{
-					old_val = m_data.load();
-					continue;
-				}
-			}
-
-			m_data.wait(old_val | c_dirty);
-			old_val = m_data.load();
-		}
-
-		return reinterpret_cast<T>(clamp_value(old_val));
-	}
-
-	void store(T value)
-	{
-		static_cast<void>(exchange(value));
-	}
-
-	T exchange(T value)
-	{
-		type old_val = m_data.load();
-
-		while (is_locked(old_val) || !m_data.compare_and_swap_test(old_val, clamp_value(reinterpret_cast<type>(value)))) [[unlikely]]
-		{
-			if ((old_val & c_dirty) == 0)
-			{
-				if (!m_data.compare_and_swap_test(old_val, old_val | c_dirty))
-				{
-					old_val = m_data.load();
-					continue;
-				}
-			}
-
-			m_data.wait(old_val);
-			old_val = m_data.load();
-		}
-
-		return reinterpret_cast<T>(clamp_value(old_val));
-	}
-
-	T compare_and_swap(T cmp, T exch)
-	{
-		static_cast<void>(compare_exchange(cmp, exch));
-		return cmp;
-	}
-
-	bool compare_and_swap_test(T cmp, T exch)
-	{
-		return compare_exchange(cmp, exch);
-	}
-
-	bool compare_exchange(T& cmp_and_old, T exch)
-	{
-		type old_val = m_data.load();
-		type expected = clamp_value(reinterpret_cast<type>(cmp_and_old));
-		type new_val = clamp_value(reinterpret_cast<type>(exch));
-
-		while (is_locked(old_val) || (old_val == expected && !m_data.compare_and_swap_test(expected, new_val))) [[unlikely]]
-		{
-			if (old_val == expected)
-			{
-				old_val = m_data.load();
-				continue;
-			}
-
-			if ((old_val & c_dirty) == 0)
-			{
-				if (!m_data.compare_and_swap_test(old_val, old_val | c_dirty))
-				{
-					old_val = m_data.load();
-					continue;
-				}
-			}
-
-			m_data.wait(old_val);
-			old_val = m_data.load();
-		}
-
-		cmp_and_old = reinterpret_cast<T>(clamp_value(old_val));
-
-		return clamp_value(old_val) == expected;
-	}
-
-	template <typename F, typename RT = std::invoke_result_t<F, T&>>
-	RT atomic_op(F func)
-	{
-		type _new, old;
-		old = m_data.load();
-
-		while (true)
-		{
-			if (is_locked(old)) [[unlikely]]
-			{
-				if ((old & c_dirty) == 0)
-				{
-					if (!m_data.compare_and_swap_test(old, old | c_dirty))
-					{
-						old = m_data.load();
-						continue;
-					}
-				}
-
-				m_data.wait(old);
-				old = m_data.load();
-				continue;
-			}
-
-			_new = old;
-
-			if constexpr (std::is_void_v<RT>)
-			{
-				std::invoke(func, reinterpret_cast<T&>(_new));
-
-				if (atomic_storage<type>::compare_exchange(m_data.raw(), old, clamp_value(_new))) [[likely]]
-				{
-					return;
-				}
-			}
-			else
-			{
-				RT result = std::invoke(func, reinterpret_cast<T&>(_new));
-
-				if (atomic_storage<type>::compare_exchange(m_data.raw(), old, clamp_value(_new))) [[likely]]
-				{
-					return result;
-				}
-			}
-		}
-	}
-
-	auto fetch_add(const ptr_rt& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return std::exchange(v, (v += rhs));
-		});
-	}
-
-	auto operator +=(const ptr_rt& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return v += rhs;
-		});
-	}
-
-	auto fetch_sub(const ptr_rt& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return std::exchange(v, (v -= rhs));
-		});
-	}
-
-	auto operator -=(const ptr_rt& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return v -= rhs;
-		});
-	}
-
-	auto fetch_and(const T& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return std::exchange(v, (v &= rhs));
-		});
-	}
-
-	auto operator &=(const T& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return v &= rhs;
-		});
-	}
-
-	auto fetch_or(const T& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return std::exchange(v, (v |= rhs));
-		});
-	}
-
-	auto operator |=(const T& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return v |= rhs;
-		});
-	}
-
-	auto fetch_xor(const T& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return std::exchange(v, (v ^= rhs));
-		});
-	}
-
-	auto operator ^=(const T& rhs)
-	{
-		return atomic_op([&](T& v)
-		{
-			return v ^= rhs;
-		});
-	}
-
-	auto operator ++()
-	{
-		return atomic_op([](T& v)
-		{
-			return ++v;
-		});
-	}
-
-	auto operator --()
-	{
-		return atomic_op([](T& v)
-		{
-			return --v;
-		});
-	}
-
-	auto operator ++(int)
-	{
-		return atomic_op([](T& v)
-		{
-			return v++;
-		});
-	}
-
-	auto operator --(int)
-	{
-		return atomic_op([](T& v)
-		{
-			return v--;
-		});
-	}
-};
-
-using fat_atomic_u1 = atomic_with_lock_bit<u8, 1>;
-using fat_atomic_u6 = atomic_with_lock_bit<u8, 6>;
-using fat_atomic_s6 = atomic_with_lock_bit<s8, 6>;
-using fat_atomic_u8 = atomic_with_lock_bit<u16, 8>;
-using fat_atomic_s8 = atomic_with_lock_bit<s16, 8>;
-
-using fat_atomic_u14 = atomic_with_lock_bit<u16, 14>;
-using fat_atomic_s14 = atomic_with_lock_bit<s16, 14>;
-using fat_atomic_u16 = atomic_with_lock_bit<u32, 16>;
-using fat_atomic_s16 = atomic_with_lock_bit<s32, 16>;
-
-using fat_atomic_u30 = atomic_with_lock_bit<u32, 30>;
-using fat_atomic_s30 = atomic_with_lock_bit<s32, 30>;
-using fat_atomic_u32 = atomic_with_lock_bit<u64, 32>;
-using fat_atomic_s32 = atomic_with_lock_bit<s64, 32>;
-using fat_atomic_u62 = atomic_with_lock_bit<u64, 62>;
-using fat_atomic_s62 = atomic_with_lock_bit<s64, 62>;
-
-template <typename Ptr>
-using fat_atomic_ptr = atomic_with_lock_bit<Ptr*, 0>;
-
-namespace detail
-{
-	template <typename Arg, typename... Args>
-	struct mao_func_t
-	{
-		template <typename... TArgs>
-		using RT = typename mao_func_t<Args...>::template RT<TArgs..., Arg>;
-	};
-
-	template <typename Arg>
-	struct mao_func_t<Arg>
-	{
-		template <typename... TArgs>
-		using RT = std::invoke_result_t<Arg, simple_t<TArgs>&...>;
-	};
-
-	template <typename... Args>
-	using mao_result = typename mao_func_t<std::decay_t<Args>...>::template RT<>;
-
-	template <typename RT, typename... Args, std::size_t... I>
-	RT multi_atomic_op(std::index_sequence<I...>, Args&&... args)
-	{
-		// Tie all arguments (function is the latest)
-		auto vars = std::tie(args...);
-
-		// Lock all variables
-		std::lock(std::get<I>(vars)...);
-
-		// Load initial values
-		auto values = std::make_tuple(std::get<I>(vars).raw_load()...);
-
-		if constexpr (std::is_void_v<RT>)
-		{
-			std::invoke(std::get<(sizeof...(Args) - 1)>(vars), reinterpret_cast<typename std::remove_reference_t<decltype(std::get<I>(vars))>::base_type&>(std::get<I>(values))...);
-
-			// Unlock and return
-			(std::get<I>(vars).raw_release(std::get<I>(values)), ...);
-		}
-		else
-		{
-			RT result = std::invoke(std::get<(sizeof...(Args) - 1)>(vars), reinterpret_cast<typename std::remove_reference_t<decltype(std::get<I>(vars))>::base_type&>(std::get<I>(values))...);
-
-			// Unlock and return the result
-			(std::get<I>(vars).raw_release(std::get<I>(values)), ...);
-
-			return result;
-		}
-	}
-}
-
-// Atomic operation; returns function result value, function is the lambda
-template <typename... Args, typename RT = detail::mao_result<Args...>>
-RT multi_atomic_op(Args&&... args)
-{
-	return detail::multi_atomic_op<RT>(std::make_index_sequence<(sizeof...(Args) - 1)>(), std::forward<Args>(args)...);
-}

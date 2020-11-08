@@ -1245,12 +1245,70 @@ std::string spu_thread::dump_regs() const
 
 std::string spu_thread::dump_callstack() const
 {
-	return {};
+	std::string ret;
+
+	fmt::append(ret, "Call stack:\n=========\n0x%08x (0x0) called\n", pc);
+
+	for (const auto& sp : dump_callstack_list())
+	{
+		// TODO: function addresses too
+		fmt::append(ret, "> from 0x%08x (sp=0x%08x)\n", sp.first, sp.second);
+	}
+
+	return ret;
 }
 
 std::vector<std::pair<u32, u32>> spu_thread::dump_callstack_list() const
 {
-	return {};
+	std::vector<std::pair<u32, u32>> call_stack_list;
+
+	bool first = true;
+
+	// Declare first 128-bytes as invalid for stack (common values such as 0 do not make sense here)
+	for (u32 sp = gpr[1]._u32[3]; (sp & ~0x3FFF0) == 0u && sp >= 0x80u; sp = _ref<u32>(sp))
+	{
+		v128 lr = _ref<v128>(sp + 16);
+
+		auto is_invalid = [this](v128 v)
+		{
+			const u32 addr = v._u32[3] & 0x3FFFC;
+
+			if (v != v128::from32r(addr))
+			{
+				// 1) Non-zero lower words are invalid (because BRSL-like instructions generate only zeroes)
+				// 2) Bits normally masked out by indirect braches are considered invalid
+				return true;
+			}
+
+			const u32 op = _ref<u32>(addr);
+			return s_spu_itype.decode(op) == spu_itype::UNK || !op;
+		};
+
+		if (is_invalid(lr))
+		{
+			if (std::exchange(first, false))
+			{
+				// Function hasn't saved LR, could be because it's a leaf function
+				// Use LR directly instead
+				lr = gpr[0];
+
+				if (is_invalid(lr))
+				{
+					// Skip it, workaround
+					continue;
+				}
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		// TODO: function addresses too
+		call_stack_list.emplace_back(lr._u32[3], sp);
+	}
+
+	return call_stack_list;
 }
 
 std::string spu_thread::dump_misc() const
@@ -2599,9 +2657,13 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		if (raddr)
 		{
 			// Last check for event before we clear the reservation
-			if (raddr == addr || rtime != vm::reservation_acquire(raddr, 128) || !cmp_rdata(rdata, vm::_ref<spu_rdata_t>(raddr)))
+			if (raddr == addr)
 			{
 				set_events(SPU_EVENT_LR);
+			}
+			else
+			{
+				get_events(SPU_EVENT_LR);
 			}
 		}
 
@@ -2974,7 +3036,7 @@ bool spu_thread::process_mfc_cmd()
 		if (raddr && raddr != addr)
 		{
 			// Last check for event before we replace the reservation with a new one
-			if (vm::reservation_acquire(raddr, 128) != rtime || !cmp_rdata(temp, vm::_ref<spu_rdata_t>(raddr)))
+			if (reservation_check(raddr, temp))
 			{
 				set_events(SPU_EVENT_LR);
 			}
@@ -3146,6 +3208,28 @@ bool spu_thread::process_mfc_cmd()
 		ch_mfc_cmd.cmd, ch_mfc_cmd.lsa, ch_mfc_cmd.eal, ch_mfc_cmd.tag, ch_mfc_cmd.size);
 }
 
+bool spu_thread::reservation_check(u32 addr, const decltype(rdata)& data)
+{
+	if (!addr)
+	{
+		// No reservation to be lost in the first place
+		return false;
+	}
+
+	if ((vm::reservation_acquire(addr, 128) & -128) != rtime)
+	{
+		return true;
+	}
+
+	// Ensure data is allocated (HACK: would raise LR event if not)
+	vm::range_lock<false>(range_lock, addr, 128);
+
+	const bool res = *range_lock && cmp_rdata(data, vm::_ref<decltype(rdata)>(addr));
+
+	range_lock->release(0);
+	return !res;
+}
+
 spu_thread::ch_events_t spu_thread::get_events(u32 mask_hint, bool waiting, bool reading)
 {
 	if (auto mask1 = ch_events.load().mask; mask1 & ~SPU_EVENT_IMPLEMENTED)
@@ -3157,10 +3241,13 @@ retry:
 	u32 collect = 0;
 
 	// Check reservation status and set SPU_EVENT_LR if lost
-	if (mask_hint & SPU_EVENT_LR && raddr && ((vm::reservation_acquire(raddr, sizeof(rdata)) & -128) != rtime || !cmp_rdata(rdata, vm::_ref<spu_rdata_t>(raddr))))
+	if (mask_hint & SPU_EVENT_LR)
 	{
-		collect |= SPU_EVENT_LR;
-		raddr = 0;
+		if (reservation_check(raddr, rdata))
+		{
+			collect |= SPU_EVENT_LR;
+			raddr = 0;
+		}
 	}
 
 	// SPU Decrementer Event on underflow (use the upper 32-bits to determine it)

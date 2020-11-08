@@ -792,7 +792,7 @@ public:
 	template<typename T>
 	to_be_t<T>* _ptr(u32 lsa) const
 	{
-		return reinterpret_cast<to_be_t<T>*>(ls + lsa);
+		return reinterpret_cast<to_be_t<T>*>(ls + (lsa % SPU_LS_SIZE));
 	}
 
 	// Convert specified SPU LS address to a reference of specified (possibly converted to BE) type
@@ -806,6 +806,10 @@ public:
 	{
 		return thread_type;
 	}
+
+	// Returns true if reservation existed but was just discovered to be lost
+	// It is safe to use on any address, even if not directly accessed by SPU (so it's slower)
+	bool reservation_check(u32 addr, const decltype(rdata)& data);
 
 	bool read_reg(const u32 addr, u32& value);
 	bool write_reg(const u32 addr, const u32 value);
