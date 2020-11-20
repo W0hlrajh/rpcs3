@@ -1,7 +1,8 @@
 #include "stdafx.h"
 #include "util/logs.hpp"
-#include "VirtualMemory.h"
+#include "util/vm.hpp"
 #ifdef _WIN32
+#include "util/dyn_lib.hpp"
 #include <Windows.h>
 #else
 #include <sys/mman.h>
@@ -30,6 +31,11 @@ static int memfd_create_(const char *name, uint flags)
 
 namespace utils
 {
+#ifdef _WIN32
+	DYNAMIC_IMPORT("KernelBase.dll", VirtualAlloc2, PVOID(HANDLE Process, PVOID Base, SIZE_T Size, ULONG AllocType, ULONG Prot, MEM_EXTENDED_PARAMETER*, ULONG));
+	DYNAMIC_IMPORT("KernelBase.dll", MapViewOfFile3, PVOID(HANDLE Handle, HANDLE Process, PVOID Base, ULONG64 Off, SIZE_T ViewSize, ULONG AllocType, ULONG Prot, MEM_EXTENDED_PARAMETER*, ULONG));
+#endif
+
 	// Convert memory protection (internal)
 	static auto operator +(protection prot)
 	{
@@ -180,9 +186,19 @@ namespace utils
 #endif
 	}
 
+	bool memory_lock(void* pointer, std::size_t size)
+	{
+#ifdef _WIN32
+		return ::VirtualLock(pointer, size);
+#else
+		return !::mlock(pointer, size);
+#endif
+	}
+
 	shm::shm(u32 size, u32 flags)
 		: m_size(::align(size, 0x10000))
 		, m_flags(flags)
+		, m_ptr(0)
 	{
 #ifdef _WIN32
 		m_handle = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, 0, m_size, NULL);
@@ -211,6 +227,8 @@ namespace utils
 
 	shm::~shm()
 	{
+		this->unmap_self();
+
 #ifdef _WIN32
 		::CloseHandle(m_handle);
 #else
@@ -251,8 +269,32 @@ namespace utils
 
 		return nullptr;
 #else
-		const u64 ptr64 = reinterpret_cast<u64>(ptr);
-		return static_cast<u8*>(::mmap(reinterpret_cast<void*>(ptr64 & -0x10000), m_size, +prot, MAP_SHARED | (ptr ? MAP_FIXED : 0), m_file, 0));
+		const u64 ptr64 = reinterpret_cast<u64>(ptr) & -0x10000;
+
+		if (ptr64)
+		{
+			return reinterpret_cast<u8*>(reinterpret_cast<u64>(::mmap(reinterpret_cast<void*>(ptr64), m_size, +prot, MAP_SHARED | MAP_FIXED, m_file, 0)));
+		}
+		else
+		{
+			const u64 res64 = reinterpret_cast<u64>(::mmap(reinterpret_cast<void*>(ptr64), m_size + 0xf000, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0));
+
+			const u64 aligned = ::align(res64, 0x10000);
+			const auto result = ::mmap(reinterpret_cast<void*>(aligned), m_size, +prot, MAP_SHARED | MAP_FIXED, m_file, 0);
+
+			// Now cleanup remnants
+			if (aligned > res64)
+			{
+				verify(HERE), ::munmap(reinterpret_cast<void*>(res64), aligned - res64) == 0;
+			}
+
+			if (aligned < res64 + 0xf000)
+			{
+				verify(HERE), ::munmap(reinterpret_cast<void*>(aligned + m_size), (res64 + 0xf000) - (aligned)) == 0;
+			}
+
+			return reinterpret_cast<u8*>(result);
+		}
 #endif
 	}
 
@@ -282,6 +324,16 @@ namespace utils
 #endif
 
 		return this->map(target, prot);
+	}
+
+	u8* shm::map_self(protection prot)
+	{
+		if (!m_ptr)
+		{
+			m_ptr = this->map(nullptr, prot);
+		}
+
+		return static_cast<u8*>(m_ptr);
 	}
 
 	void shm::unmap(void* ptr) const
@@ -324,5 +376,14 @@ namespace utils
 			return;
 		}
 #endif
+	}
+
+	void shm::unmap_self()
+	{
+		if (m_ptr)
+		{
+			this->unmap(m_ptr);
+			m_ptr = nullptr;
+		}
 	}
 }

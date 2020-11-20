@@ -39,11 +39,12 @@ target_sources(rpcs3_emu PRIVATE
 	../util/logs.cpp
 	../util/yaml.cpp
 	../util/cereal.cpp
+	../util/vm_native.cpp
+	../util/dyn_lib.cpp
 	../../Utilities/bin_patch.cpp
 	../../Utilities/cheat_info.cpp
 	../../Utilities/cond.cpp
 	../../Utilities/Config.cpp
-	../../Utilities/dynamic_library.cpp
 	../../Utilities/File.cpp
 	../../Utilities/JIT.cpp
 	../../Utilities/LUrlParser.cpp
@@ -54,7 +55,6 @@ target_sources(rpcs3_emu PRIVATE
 	../../Utilities/sysinfo.cpp
 	../../Utilities/Thread.cpp
 	../../Utilities/version.cpp
-	../../Utilities/VirtualMemory.cpp
 )
 
 target_include_directories(rpcs3_emu PUBLIC "${CMAKE_SOURCE_DIR}")
@@ -365,6 +365,7 @@ target_sources(rpcs3_emu PRIVATE
 # Np
 target_sources(rpcs3_emu PRIVATE
 	NP/fb_helpers.cpp
+	NP/np_contexts.cpp
 	NP/np_handler.cpp
 	NP/signaling_handler.cpp
 	NP/np_structs_extra.cpp

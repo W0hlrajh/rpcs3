@@ -17,7 +17,7 @@
 #include "Utilities/sema.h"
 #ifdef _WIN32
 #include <windows.h>
-#include "Utilities/dynamic_library.h"
+#include "util/dyn_lib.hpp"
 DYNAMIC_IMPORT("ntdll.dll", NtQueryTimerResolution, NTSTATUS(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution));
 DYNAMIC_IMPORT("ntdll.dll", NtSetTimerResolution, NTSTATUS(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution));
 #else
@@ -292,6 +292,7 @@ int main(int argc, char** argv)
 #ifdef _WIN32
 	ULONG64 intro_cycles{};
 	QueryThreadCycleTime(GetCurrentThread(), &intro_cycles);
+	SetProcessWorkingSetSize(GetCurrentProcess(), 0x60000000, 0x80000000); // 2GiB
 #elif defined(RUSAGE_THREAD)
 	struct ::rusage intro_stats{};
 	::getrusage(RUSAGE_THREAD, &intro_stats);
@@ -412,8 +413,17 @@ int main(int argc, char** argv)
 	struct ::rlimit rlim;
 	rlim.rlim_cur = 4096;
 	rlim.rlim_max = 4096;
+#ifdef RLIMIT_NOFILE
 	if (::setrlimit(RLIMIT_NOFILE, &rlim) != 0)
-		std::fprintf(stderr, "Failed to set max open file limit (4096).");
+		std::fprintf(stderr, "Failed to set max open file limit (4096).\n");
+#endif
+
+	rlim.rlim_cur = 0x80000000;
+	rlim.rlim_max = 0x80000000;
+#ifdef RLIMIT_MEMLOCK
+	if (::setrlimit(RLIMIT_MEMLOCK, &rlim) != 0)
+		std::fprintf(stderr, "Failed to set RLIMIT_MEMLOCK size to 2 GiB. Try to update your system configuration.\n");
+#endif
 	// Work around crash on startup on KDE: https://bugs.kde.org/show_bug.cgi?id=401637
 	setenv( "KDE_DEBUG", "1", 0 );
 #endif

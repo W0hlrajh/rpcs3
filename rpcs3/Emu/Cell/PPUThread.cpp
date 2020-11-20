@@ -1,5 +1,4 @@
 ﻿#include "stdafx.h"
-#include "Utilities/VirtualMemory.h"
 #include "Utilities/sysinfo.h"
 #include "Utilities/JIT.h"
 #include "Crypto/sha1.h"
@@ -12,6 +11,7 @@
 #include "PPUInterpreter.h"
 #include "PPUAnalyser.h"
 #include "PPUModule.h"
+#include "PPUDisAsm.h"
 #include "SPURecompiler.h"
 #include "lv2/sys_sync.h"
 #include "lv2/sys_prx.h"
@@ -64,7 +64,7 @@
 #include <thread>
 #include <cfenv>
 #include <cctype>
-#include <string>
+#include "util/vm.hpp"
 
 const bool s_use_ssse3 = utils::has_ssse3();
 
@@ -390,13 +390,13 @@ extern bool ppu_patch(u32 addr, u32 value)
 
 	vm::reader_lock rlock;
 
-	if (!vm::check_addr(addr, sizeof(value)))
+	if (!vm::check_addr(addr))
 	{
 		ppu_log.fatal("Patch failed at 0x%x: invalid memory address.", addr);
 		return false;
 	}
 
-	const bool is_exec = vm::check_addr(addr, sizeof(value), vm::page_executable);
+	const bool is_exec = vm::check_addr(addr, vm::page_executable);
 
 	if (is_exec && g_cfg.core.ppu_decoder == ppu_decoder_type::llvm && !Emu.IsReady())
 	{
@@ -444,18 +444,18 @@ std::string ppu_thread::dump_regs() const
 
 		fmt::append(ret, "r%d%s: 0x%-8llx", i, i <= 9 ? " " : "", reg);
 
-		const u32 max_str_len = 32;
-		const u32 hex_count = 8;
+		constexpr u32 max_str_len = 32;
+		constexpr u32 hex_count = 8;
 
-		if (reg <= UINT32_MAX && vm::check_addr(static_cast<u32>(reg), max_str_len))
+		if (reg <= UINT32_MAX && vm::check_addr<max_str_len>(static_cast<u32>(reg)))
 		{
 			bool is_function = false;
 			u32 toc = 0;
 
 			if (const u32 reg_ptr = *vm::get_super_ptr<u32>(static_cast<u32>(reg));
-				vm::check_addr(reg_ptr, max_str_len))
+				vm::check_addr<max_str_len>(reg_ptr))
 			{
-				if ((reg | reg_ptr) % 4 == 0 && vm::check_addr(reg_ptr, 4, vm::page_executable))
+				if ((reg | reg_ptr) % 4 == 0 && vm::check_addr(reg_ptr, vm::page_executable))
 				{
 					toc = *vm::get_super_ptr<u32>(static_cast<u32>(reg + 4));
 
@@ -466,7 +466,7 @@ std::string ppu_thread::dump_regs() const
 					}
 				}
 			}
-			else if (reg % 4 == 0 && vm::check_addr(reg, 4, vm::page_executable))
+			else if (reg % 4 == 0 && vm::check_addr(reg, vm::page_executable))
 			{
 				is_function = true;
 			}
@@ -483,7 +483,11 @@ std::string ppu_thread::dump_regs() const
 				}
 				else
 				{
-					fmt::append(ret, " -> function-code");
+					PPUDisAsm dis_asm(CPUDisAsm_NormalMode);
+					dis_asm.offset = vm::g_sudo_addr;
+					dis_asm.dump_pc = reg;
+					dis_asm.disasm(reg);
+					fmt::append(ret, " -> %s", dis_asm.last_opcode);
 				}
 			}
 			else if (std::isprint(static_cast<u8>(buf_tmp[0])) && std::isprint(static_cast<u8>(buf_tmp[1])) && std::isprint(static_cast<u8>(buf_tmp[2])))
@@ -509,9 +513,24 @@ std::string ppu_thread::dump_regs() const
 		fmt::append(ret, "f%d%s: %.6G\n", i, i <= 9 ? " " : "", fpr[i]);
 	}
 
-	for (uint i = 0; i < 32; ++i)
+	for (uint i = 0; i < 32; ++i, ret += '\n')
 	{
-		fmt::append(ret, "v%d%s: %s [x: %g y: %g z: %g w: %g]\n", i, i <= 9 ? " " : "", vr[i], vr[i]._f[3], vr[i]._f[2], vr[i]._f[1], vr[i]._f[0]);
+		fmt::append(ret, "v%d%s: ", i, i <= 9 ? " " : "");
+
+		const auto r = vr[i];
+		const u32 i3 = r.u32r[0];
+
+		if (v128::from32p(i3) == r)
+		{
+			// Shortand formatting
+			fmt::append(ret, "%08x", i3);
+			fmt::append(ret, " [x: %g]", r.fr[0]);
+		}
+		else
+		{
+			fmt::append(ret, "%08x %08x %08x %08x", r.u32r[0], r.u32r[1], r.u32r[2], r.u32r[3]);
+			fmt::append(ret, " [x: %g y: %g z: %g w: %g]", r.fr[0], r.fr[1], r.fr[2], r.fr[3]);
+		}
 	}
 
 	fmt::append(ret, "CR: 0x%08x\n", cr.pack());
@@ -558,7 +577,7 @@ std::vector<std::pair<u32, u32>> ppu_thread::dump_callstack_list() const
 
 	const u32 stack_ptr = static_cast<u32>(r1);
 
-	if (!vm::check_addr(stack_ptr, 1, vm::page_writable))
+	if (!vm::check_addr(stack_ptr, vm::page_writable))
 	{
 		// Normally impossible unless the code does not follow ABI rules
 		return {};
@@ -567,12 +586,12 @@ std::vector<std::pair<u32, u32>> ppu_thread::dump_callstack_list() const
 	u32 stack_min = stack_ptr & ~0xfff;
 	u32 stack_max = stack_min + 4096;
 
-	while (stack_min && vm::check_addr(stack_min - 4096, 4096, vm::page_writable))
+	while (stack_min && vm::check_addr(stack_min - 4096, vm::page_writable))
 	{
 		stack_min -= 4096;
 	}
 
-	while (stack_max + 4096 && vm::check_addr(stack_max, 4096, vm::page_writable))
+	while (stack_max + 4096 && vm::check_addr(stack_max, vm::page_writable))
 	{
 		stack_max += 4096;
 	}
@@ -584,14 +603,14 @@ std::vector<std::pair<u32, u32>> ppu_thread::dump_callstack_list() const
 	for (
 		u64 sp = r1;
 		sp % 0x10 == 0u && sp >= stack_min && sp <= stack_max - ppu_stack_start_offset;
-		sp = *vm::get_super_ptr<u64>(static_cast<u32>(sp))
+		sp = *vm::get_super_ptr<u64>(static_cast<u32>(sp)), first = false
 		)
 	{
 		u64 addr = *vm::get_super_ptr<u64>(static_cast<u32>(sp + 16));
 
 		auto is_invalid = [](u64 addr)
 		{
-			if (addr > UINT32_MAX || addr % 4 || !vm::check_addr(static_cast<u32>(addr), 1, vm::page_executable))
+			if (addr > UINT32_MAX || addr % 4 || !vm::check_addr(static_cast<u32>(addr), vm::page_executable))
 			{
 				return true;
 			}
@@ -602,7 +621,7 @@ std::vector<std::pair<u32, u32>> ppu_thread::dump_callstack_list() const
 
 		if (is_invalid(addr))
 		{
-			if (std::exchange(first, false))
+			if (first)
 			{
 				// Function hasn't saved LR, could be because it's a leaf function
 				// Use LR directly instead
@@ -781,7 +800,7 @@ void ppu_thread::cpu_sleep()
 	raddr = 0;
 
 	// Setup wait flag and memory flags to relock itself
-	state += cpu_flag::wait + cpu_flag::memory;
+	state += g_use_rtm ? cpu_flag::wait : cpu_flag::wait + cpu_flag::memory;
 
 	if (auto ptr = vm::g_tls_locked)
 	{
@@ -1121,7 +1140,7 @@ void ppu_trap(ppu_thread& ppu, u64 addr)
 	u32 add = static_cast<u32>(g_cfg.core.stub_ppu_traps) * 4;
 
 	// If stubbing is enabled, check current instruction and the following
-	if (!add || !vm::check_addr(ppu.cia, 4, vm::page_executable) || !vm::check_addr(ppu.cia + add, 4, vm::page_executable))
+	if (!add || !vm::check_addr(ppu.cia, vm::page_executable) || !vm::check_addr(ppu.cia + add, vm::page_executable))
 	{
 		fmt::throw_exception("PPU Trap!" HERE);
 	}
@@ -1372,7 +1391,6 @@ const auto ppu_stcx_accurate_tx = build_function_asm<u64(*)(u32 raddr, u64 rtime
 		c.jae(fall);
 	});
 	c.bt(x86::dword_ptr(args[2], ::offset32(&spu_thread::state) - ::offset32(&ppu_thread::rdata)), static_cast<u32>(cpu_flag::pause));
-	c.mov(x86::eax, _XABORT_EXPLICIT);
 	c.jc(fall);
 	c.xbegin(tx0);
 	c.mov(x86::rax, x86::qword_ptr(x86::rbx));
@@ -1454,17 +1472,9 @@ const auto ppu_stcx_accurate_tx = build_function_asm<u64(*)(u32 raddr, u64 rtime
 	c.bind(skip);
 	c.xend();
 	build_get_tsc(c, stamp1);
-	c.mov(x86::eax, _XABORT_EXPLICIT);
 	//c.jmp(fall);
 
 	c.bind(fall);
-
-	// Touch memory if transaction failed with status 0
-	c.test(x86::eax, x86::eax);
-	c.jnz(next);
-	c.xor_(x86::rbp, 0xf80);
-	c.lock().add(x86::dword_ptr(x86::rbp), 0);
-	c.xor_(x86::rbp, 0xf80);
 
 	Label fall2 = c.newLabel();
 	Label fail2 = c.newLabel();
@@ -1676,7 +1686,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		if (raddr / 128 != addr / 128 || !ppu.use_full_rdata)
 		{
 			// Even when the reservation address does not match the target address must be valid
-			if (!vm::check_addr(addr, 1, vm::page_writable))
+			if (!vm::check_addr(addr, vm::page_writable))
 			{
 				// Access violate
 				data += 0;
@@ -1704,7 +1714,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 					auto& all_data = *vm::get_super_ptr<spu_rdata_t>(addr & -128);
 					auto& sdata = *vm::get_super_ptr<atomic_be_t<u64>>(addr & -8);
 
-					const bool ok = cpu_thread::suspend_all<+1>(&ppu, {all_data, all_data + 64, &res}, [&]
+					const bool ok = cpu_thread::suspend_all<+3>(&ppu, {all_data, all_data + 64, &res}, [&]
 					{
 						if ((res & -128) == rtime && cmp_rdata(ppu.rdata, all_data))
 						{

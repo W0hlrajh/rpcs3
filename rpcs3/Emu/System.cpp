@@ -3,6 +3,7 @@
 #include "Utilities/bin_patch.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/System.h"
+#include "Emu/perf_meter.hpp"
 
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/PPUCallback.h"
@@ -86,6 +87,11 @@ namespace
 	struct progress_dialog_server;
 }
 
+namespace atomic_wait
+{
+	extern void parse_hashtable(bool(*cb)(u64 id, u16 refs, u32 ptr, u32 stats));
+}
+
 template<>
 void fmt_class_string<game_boot_result>::format(std::string& out, u64 arg)
 {
@@ -102,6 +108,7 @@ void fmt_class_string<game_boot_result>::format(std::string& out, u64 arg)
 		case game_boot_result::decryption_error: return "Failed to decrypt content";
 		case game_boot_result::file_creation_error: return "Could not create important files";
 		case game_boot_result::firmware_missing: return "Firmware is missing";
+		case game_boot_result::unsupported_disc_type: return "This disc type is not supported yet";
 		}
 		return unknown;
 	});
@@ -1237,38 +1244,59 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 		}
 
 		// Detect boot location
-		const std::string hdd0_game = vfs::get("/dev_hdd0/game/");
-		const std::string hdd0_disc = vfs::get("/dev_hdd0/disc/");
-		const std::size_t game_dir_size = 8; // size of PS3_GAME and PS3_GMXX
-		const std::size_t bdvd_pos = m_cat == "DG" && bdvd_dir.empty() && disc.empty() ? elf_dir.rfind("/USRDIR") - game_dir_size : 0;
-		const bool from_hdd0_game = m_path.find(hdd0_game) != umax;
+		constexpr size_t game_dir_size = 8; // size of PS3_GAME and PS3_GMXX
+		const std::string hdd0_game    = vfs::get("/dev_hdd0/game/");
+		const std::string hdd0_disc    = vfs::get("/dev_hdd0/disc/");
+		const bool from_hdd0_game      = m_path.find(hdd0_game) != umax;
 
-		if (bdvd_pos && from_hdd0_game)
+		// Mount /dev_bdvd/ if necessary
+		if (bdvd_dir.empty() && disc.empty())
 		{
-			// Booting disc game from wrong location
-			sys_log.error("Disc game %s found at invalid location /dev_hdd0/game/", m_title_id);
+			if (const size_t usrdir_pos = elf_dir.rfind("/USRDIR"); usrdir_pos != umax)
+			{
+				const std::string main_dir = elf_dir.substr(0, usrdir_pos);
 
-			// Move and retry from correct location
-			if (fs::rename(elf_dir + "/../../", hdd0_disc + elf_dir.substr(hdd0_game.size()) + "/../../", false))
-			{
-				sys_log.success("Disc game %s moved to special location /dev_hdd0/disc/", m_title_id);
-				return m_path = hdd0_disc + m_path.substr(hdd0_game.size()), Load(m_title_id, add_only, force_global_config);
-			}
-			else
-			{
-				sys_log.error("Failed to move disc game %s to /dev_hdd0/disc/ (%s)", m_title_id, fs::g_tls_error);
-				return game_boot_result::wrong_disc_location;
+				if (const std::string sfb_dir = fs::get_parent_dir(main_dir);
+					!sfb_dir.empty() && fs::is_file(sfb_dir + "/PS3_DISC.SFB"))
+				{
+					if (from_hdd0_game)
+					{
+						// Booting disc game from wrong location
+						sys_log.error("Disc game %s found at invalid location /dev_hdd0/game/", m_title_id);
+
+						// Move and retry from correct location
+						if (fs::rename(elf_dir + "/../../", hdd0_disc + elf_dir.substr(hdd0_game.size()) + "/../../", false))
+						{
+							sys_log.success("Disc game %s moved to special location /dev_hdd0/disc/", m_title_id);
+							return m_path = hdd0_disc + m_path.substr(hdd0_game.size()), Load(m_title_id, add_only, force_global_config);
+						}
+						else
+						{
+							sys_log.error("Failed to move disc game %s to /dev_hdd0/disc/ (%s)", m_title_id, fs::g_tls_error);
+							return game_boot_result::wrong_disc_location;
+						}
+					}
+
+					bdvd_dir = sfb_dir + "/";
+
+					// Find game dir
+					if (const std::string main_dir_name = main_dir.substr(main_dir.find_last_of("/\\") + 1);
+						main_dir_name.size() == game_dir_size)
+					{
+						m_game_dir = main_dir_name;
+					}
+					else
+					{
+						// Show an error and reset game dir for now
+						m_game_dir = "PS3_GAME";
+						sys_log.error("Could not find proper game dir path for %s", elf_dir);
+						return game_boot_result::unsupported_disc_type;
+					}
+				}
 			}
 		}
 
-		// Booting disc game
-		if (bdvd_pos)
-		{
-			// Mount /dev_bdvd/ if necessary
-			bdvd_dir = elf_dir.substr(0, bdvd_pos);
-			m_game_dir = elf_dir.substr(bdvd_pos, game_dir_size);
-		}
-		else if (!is_disc_patch)
+		if (bdvd_dir.empty() && !is_disc_patch)
 		{
 			// Reset original disc game dir if this is neither disc nor disc patch
 			m_game_dir = "PS3_GAME";
@@ -1300,9 +1328,11 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 			vfs::mount("/dev_bdvd/PS3_GAME", bdvd_dir + m_game_dir + "/");
 			sys_log.notice("Game: %s", vfs::get("/dev_bdvd/PS3_GAME"));
 
-			if (!sfb_file.open(vfs::get("/dev_bdvd/PS3_DISC.SFB")) || sfb_file.size() < 4 || sfb_file.read<u32>() != ".SFB"_u32)
+			const auto sfb_path = vfs::get("/dev_bdvd/PS3_DISC.SFB");
+
+			if (!sfb_file.open(sfb_path) || sfb_file.size() < 4 || sfb_file.read<u32>() != ".SFB"_u32)
 			{
-				sys_log.error("Invalid disc directory for the disc game %s", m_title_id);
+				sys_log.error("Invalid disc directory for the disc game %s. (%s)", m_title_id, sfb_path);
 				return game_boot_result::invalid_file_or_folder;
 			}
 
@@ -1464,7 +1494,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 		// Check game updates
 		const std::string hdd0_boot = hdd0_game + m_title_id + "/USRDIR/EBOOT.BIN";
 
-		if (disc.empty() && m_cat == "DG" && fs::is_file(hdd0_boot))
+		if (disc.empty() && !bdvd_dir.empty() && m_path != hdd0_boot && fs::is_file(hdd0_boot))
 		{
 			// Booting game update
 			sys_log.success("Updates found at /dev_hdd0/game/%s/!", m_title_id);
@@ -1792,6 +1822,8 @@ void Emulator::Resume()
 		ppu_log.notice("[RESUME] Dumping instruction stats:%s", dump);
 	}
 
+	perf_stat_base::report();
+
 	// Try to resume
 	if (!m_state.compare_and_swap_test(system_state::paused, system_state::running))
 	{
@@ -1874,6 +1906,37 @@ void Emulator::Stop(bool restart)
 	vm::close();
 
 	jit_runtime::finalize();
+
+	perf_stat_base::report();
+
+	static u64 aw_refs = 0;
+	static u64 aw_colm = 0;
+	static u64 aw_colc = 0;
+	static u64 aw_used = 0;
+
+	aw_refs = 0;
+	aw_colm = 0;
+	aw_colc = 0;
+	aw_used = 0;
+
+	atomic_wait::parse_hashtable([](u64 id, u16 refs, u32 ptr, u32 stats) -> bool
+	{
+		aw_refs += refs;
+		aw_used += ptr != 0;
+
+		stats = (stats & 0xaaaaaaaa) / 2 + (stats & 0x55555555);
+		stats = (stats & 0xcccccccc) / 4 + (stats & 0x33333333);
+		stats = (stats & 0xf0f0f0f0) / 16 + (stats & 0xf0f0f0f);
+		stats = (stats & 0xff00ff00) / 256 + (stats & 0xff00ff);
+		stats = (stats >> 16) + (stats & 0xffff);
+
+		aw_colm = std::max<u64>(aw_colm, stats);
+		aw_colc += stats != 0;
+
+		return false;
+	});
+
+	sys_log.notice("Atomic wait hashtable stats: [in_use=%u, used=%u, max_collision_weight=%u, total_collisions=%u]", aw_refs, aw_used, aw_colm, aw_colc);
 
 	if (restart)
 	{
