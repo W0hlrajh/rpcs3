@@ -6,6 +6,7 @@
 
 #include <unordered_set>
 #include "util/yaml.hpp"
+#include "Emu/Cell/lv2/sys_memory.h"
 #include "util/asm.hpp"
 
 LOG_CHANNEL(ppu_validator);
