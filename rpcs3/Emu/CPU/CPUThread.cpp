@@ -329,10 +329,16 @@ namespace cpu_counter
 
 	void remove(cpu_thread* _this) noexcept
 	{
+		// Return if not registered
+		const u32 slot = s_tls_thread_slot;
+
+		if (slot == umax)
+		{
+			return;
+		}
+
 		// Unregister and wait if necessary
 		verify(HERE), _this->state & cpu_flag::wait;
-
-		u32 slot = s_tls_thread_slot;
 
 		if (slot >= std::size(s_cpu_list))
 		{
@@ -863,7 +869,7 @@ bool cpu_thread::suspend_work::push(cpu_thread* _this) noexcept
 		{
 			if (cpu != _this)
 			{
-				_m_prefetchw(&cpu->state);
+				utils::prefetch_write(&cpu->state);
 				return true;
 			}
 
@@ -940,13 +946,13 @@ bool cpu_thread::suspend_work::push(cpu_thread* _this) noexcept
 		{
 			for (u32 i = 0; i < work->prf_size; i++)
 			{
-				_m_prefetchw(work->prf_list[0]);
+				utils::prefetch_write(work->prf_list[0]);
 			}
 		}
 
 		cpu_counter::for_all_cpu(copy2, [&](cpu_thread* cpu)
 		{
-			_m_prefetchw(&cpu->state);
+			utils::prefetch_write(&cpu->state);
 			return true;
 		});
 

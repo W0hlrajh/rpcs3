@@ -42,7 +42,6 @@ namespace atomic_wait
 		byteswap = 1 << 6, // Perform byteswap on both arguments and masks when applicable
 	};
 
-	constexpr op_flag op_ne = {};
 	constexpr op_flag op_be = std::endian::native == std::endian::little ? op_flag::byteswap : op_flag{0};
 	constexpr op_flag op_le = std::endian::native == std::endian::little ? op_flag{0} : op_flag::byteswap;
 
@@ -60,6 +59,8 @@ namespace atomic_wait
 	{
 		return op{static_cast<u8>(static_cast<u8>(lhs) | static_cast<u8>(rhs))};
 	}
+
+	constexpr op op_ne = op::eq | op_flag::inverse;
 
 	struct info
 	{
@@ -87,7 +88,7 @@ namespace atomic_wait
 		template <typename T>
 		constexpr void set_value(T value = T{})
 		{
-			old = get_value<T>();
+			old = get_value<T>(value);
 		}
 
 		template <typename T>
@@ -145,13 +146,13 @@ namespace atomic_wait
 		constexpr list(atomic_t<U, Align>&... vars)
 			: m_info{{&vars.raw(), sizeof(U), info::get_value<U>(), info::get_mask<U>()}...}
 		{
-			static_assert(sizeof...(U) <= Max);
+			static_assert(sizeof...(U) == Max, "Inconsistent amount of atomics.");
 		}
 
 		template <typename... U>
 		constexpr list& values(U... values)
 		{
-			static_assert(sizeof...(U) <= Max);
+			static_assert(sizeof...(U) == Max, "Inconsistent amount of values.");
 
 			auto* ptr = m_info;
 			((ptr++)->template set_value<T>(values), ...);
@@ -159,9 +160,9 @@ namespace atomic_wait
 		}
 
 		template <typename... U>
-		constexpr list& masks(T... masks)
+		constexpr list& masks(U... masks)
 		{
-			static_assert(sizeof...(U) <= Max);
+			static_assert(sizeof...(U) <= Max, "Too many masks.");
 
 			auto* ptr = m_info;
 			((ptr++)->template set_mask<T>(masks), ...);
@@ -233,7 +234,7 @@ private:
 #ifdef _WIN32
 	__vectorcall
 #endif
-	notify_all(const void* data, u32 size, __m128i mask128, __m128i val128);
+	notify_all(const void* data, u32 size, __m128i mask128);
 
 public:
 	static void set_wait_callback(bool(*cb)(const void* data, u64 attempts, u64 stamp0));
@@ -287,7 +288,7 @@ struct atomic_storage
 
 	static inline void store(T& dest, T value)
 	{
-		__atomic_store(&dest, &value, __ATOMIC_SEQ_CST);
+		static_cast<void>(exchange(dest, value));
 	}
 
 	static inline void release(T& dest, T value)
@@ -1503,18 +1504,18 @@ public:
 	}
 
 	// Notify with mask and value, allowing to not wake up thread which doesn't wait on them
-	void notify_one(type mask_value, type new_value) noexcept
+	[[deprecated("Incomplete")]] void notify_one(type mask_value, type phantom_value) noexcept
 	{
 		if constexpr (sizeof(T) <= 8)
 		{
 			const __m128i mask = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>>(mask_value));
-			const __m128i _new = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>>(new_value));
+			const __m128i _new = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>>(phantom_value));
 			atomic_wait_engine::notify_one(&m_data, sizeof(T), mask, _new);
 		}
 		else if constexpr (sizeof(T) == 16)
 		{
 			const __m128i mask = std::bit_cast<__m128i>(mask_value);
-			const __m128i _new = std::bit_cast<__m128i>(new_value);
+			const __m128i _new = std::bit_cast<__m128i>(phantom_value);
 			atomic_wait_engine::notify_one(&m_data, sizeof(T), mask, _new);
 		}
 	}
@@ -1523,11 +1524,11 @@ public:
 	{
 		if constexpr (sizeof(T) <= 8)
 		{
-			atomic_wait_engine::notify_all(&m_data, -1, _mm_cvtsi64_si128(UINT64_MAX >> ((64 - sizeof(T) * 8) & 63)), _mm_setzero_si128());
+			atomic_wait_engine::notify_all(&m_data, -1, _mm_cvtsi64_si128(UINT64_MAX >> ((64 - sizeof(T) * 8) & 63)));
 		}
 		else if constexpr (sizeof(T) == 16)
 		{
-			atomic_wait_engine::notify_all(&m_data, -1, _mm_set1_epi64x(-1), _mm_setzero_si128());
+			atomic_wait_engine::notify_all(&m_data, -1, _mm_set1_epi64x(-1));
 		}
 	}
 
@@ -1537,29 +1538,12 @@ public:
 		if constexpr (sizeof(T) <= 8)
 		{
 			const __m128i mask = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>>(mask_value));
-			atomic_wait_engine::notify_all(&m_data, -1, mask, _mm_setzero_si128());
+			atomic_wait_engine::notify_all(&m_data, -1, mask);
 		}
 		else if constexpr (sizeof(T) == 16)
 		{
 			const __m128i mask = std::bit_cast<__m128i>(mask_value);
-			atomic_wait_engine::notify_all(&m_data, -1, mask, _mm_setzero_si128());
-		}
-	}
-
-	// Notify all threads with mask and value, allowing to not wake up threads which don't wait on them
-	void notify_all(type mask_value, type new_value) noexcept
-	{
-		if constexpr (sizeof(T) <= 8)
-		{
-			const __m128i mask = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>>(mask_value));
-			const __m128i _new = _mm_cvtsi64_si128(std::bit_cast<get_uint_t<sizeof(T)>>(new_value));
-			atomic_wait_engine::notify_all(&m_data, sizeof(T), mask, _new);
-		}
-		else if constexpr (sizeof(T) == 16)
-		{
-			const __m128i mask = std::bit_cast<__m128i>(mask_value);
-			const __m128i _new = std::bit_cast<__m128i>(new_value);
-			atomic_wait_engine::notify_all(&m_data, sizeof(T), mask, _new);
+			atomic_wait_engine::notify_all(&m_data, -1, mask);
 		}
 	}
 };

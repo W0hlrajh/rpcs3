@@ -89,7 +89,7 @@ namespace
 
 namespace atomic_wait
 {
-	extern void parse_hashtable(bool(*cb)(u64 id, u16 refs, u32 ptr, u32 stats));
+	extern void parse_hashtable(bool(*cb)(u64 id, u32 refs, u64 ptr, u32 stats));
 }
 
 template<>
@@ -1919,19 +1919,13 @@ void Emulator::Stop(bool restart)
 	aw_colc = 0;
 	aw_used = 0;
 
-	atomic_wait::parse_hashtable([](u64 id, u16 refs, u32 ptr, u32 stats) -> bool
+	atomic_wait::parse_hashtable([](u64 id, u32 refs, u64 ptr, u32 maxc) -> bool
 	{
-		aw_refs += refs;
+		aw_refs += refs != 0;
 		aw_used += ptr != 0;
 
-		stats = (stats & 0xaaaaaaaa) / 2 + (stats & 0x55555555);
-		stats = (stats & 0xcccccccc) / 4 + (stats & 0x33333333);
-		stats = (stats & 0xf0f0f0f0) / 16 + (stats & 0xf0f0f0f);
-		stats = (stats & 0xff00ff00) / 256 + (stats & 0xff00ff);
-		stats = (stats >> 16) + (stats & 0xffff);
-
-		aw_colm = std::max<u64>(aw_colm, stats);
-		aw_colc += stats != 0;
+		aw_colm = std::max<u64>(aw_colm, maxc);
+		aw_colc += maxc != 0;
 
 		return false;
 	});
@@ -1957,19 +1951,20 @@ void Emulator::Stop(bool restart)
 	// Always Enable display sleep, not only if it was prevented.
 	enable_display_sleep();
 
-	if (Quit(g_cfg.misc.autoexit.get()))
+	if (!m_force_boot)
 	{
-		return;
+		if (Quit(g_cfg.misc.autoexit.get()))
+		{
+			return;
+		}
 	}
 
 	m_force_boot = false;
-	Init();
 }
 
 bool Emulator::Quit(bool force_quit)
 {
 	m_force_boot = false;
-	Emu.Stop();
 
 	// Deinitialize object manager to prevent any hanging objects at program exit
 	*g_fxo = {};
