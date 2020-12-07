@@ -1,4 +1,4 @@
-#pragma once
+#pragma once // No BOM and only basic ASCII in this header, or a neko will die
 
 #ifdef MSVC_CRT_MEMLEAK_DETECTION
 	#define _CRTDBG_MAP_ALLOC
@@ -26,6 +26,7 @@ namespace std { inline namespace literals { inline namespace chrono_literals {}}
 #include "Utilities/StrFmt.h"
 #include "Utilities/File.h"
 #include "util/logs.hpp"
+#include "util/shared_ptr.hpp"
 
 #include <cstdlib>
 #include <cstring>

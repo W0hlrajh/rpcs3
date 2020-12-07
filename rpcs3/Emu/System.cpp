@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "VFS.h"
 #include "Utilities/bin_patch.h"
 #include "Emu/Memory/vm.h"
@@ -553,7 +553,9 @@ bool Emulator::BootRsxCapture(const std::string& path)
 	GetCallbacks().on_run(false);
 	m_state = system_state::running;
 
-	g_fxo->init<named_thread<rsx::rsx_replay_thread>>("RSX Replay"sv, std::move(frame));
+	auto replay_thr = g_fxo->init<named_thread<rsx::rsx_replay_thread>>("RSX Replay"sv, std::move(frame));
+	replay_thr->state -= cpu_flag::stop;
+	thread_ctrl::notify(*replay_thr);
 
 	return true;
 }
