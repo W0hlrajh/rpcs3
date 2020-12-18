@@ -3,8 +3,10 @@
 #include "VKVertexProgram.h"
 #include "VKFragmentProgram.h"
 #include "VKGSRender.h"
+
 #include "../Common/GLSLCommon.h"
 #include "../Common/ShaderInterpreter.h"
+#include "../rsx_methods.h"
 
 namespace vk
 {
@@ -473,7 +475,7 @@ namespace vk
 		vp.scissorCount = 1;
 
 		VkPipelineMultisampleStateCreateInfo ms = properties.state.ms;
-		verify("Multisample state mismatch!" HERE), ms.rasterizationSamples == VkSampleCountFlagBits((properties.renderpass_key >> 16) & 0xF);
+		ensure(ms.rasterizationSamples == VkSampleCountFlagBits((properties.renderpass_key >> 16) & 0xF)); // "Multisample state mismatch!"
 		if (ms.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT)
 		{
 			// Update the sample mask pointer

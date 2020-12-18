@@ -4,9 +4,10 @@
 #include "Emu/Cell/SPUInterpreter.h"
 #include "Emu/Memory/vm.h"
 #include "MFC.h"
-#include "Utilities/BEType.h"
 
 #include <map>
+#include "util/v128.hpp"
+#include "util/to_endian.hpp"
 
 LOG_CHANNEL(spu_log, "SPU");
 
@@ -568,7 +569,7 @@ public:
 			return this->_u32[3] >> 10 & 0x3;
 
 		default:
-			fmt::throw_exception("Unexpected slice value (%d)" HERE, slice);
+			fmt::throw_exception("Unexpected slice value (%d)", slice);
 		}
 	}
 

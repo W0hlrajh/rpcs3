@@ -10,6 +10,7 @@
 #include "VKCommandStream.h"
 #include "VKRenderPass.h"
 
+#include "Emu/RSX/rsx_methods.h"
 #include "Utilities/mutex.h"
 #include "Utilities/lockless.h"
 
@@ -60,6 +61,7 @@ namespace vk
 		table.add(0x1F82, 0x1FB9, chip_class::NV_turing); // TU117, TU117M, TU117GL
 		table.add(0x2182, 0x21D1, chip_class::NV_turing); // TU116, TU116M, TU116GL
 		table.add(0x20B0, 0x20BE, chip_class::NV_ampere); // GA100
+		table.add(0x2204, 0x25AF, chip_class::NV_ampere); // GA10x (RTX 30 series)
 
 		return table;
 	}();
@@ -220,8 +222,8 @@ namespace vk
 			}
 		}
 
-		if (result.device_local == VK_MAX_MEMORY_TYPES) fmt::throw_exception("GPU doesn't support device local memory" HERE);
-		if (result.host_visible_coherent == VK_MAX_MEMORY_TYPES) fmt::throw_exception("GPU doesn't support host coherent device local memory" HERE);
+		if (result.device_local == VK_MAX_MEMORY_TYPES) fmt::throw_exception("GPU doesn't support device local memory");
+		if (result.host_visible_coherent == VK_MAX_MEMORY_TYPES) fmt::throw_exception("GPU doesn't support host coherent device local memory");
 		return result;
 	}
 
@@ -468,7 +470,7 @@ namespace vk
 
 	vk::mem_allocator_base* get_current_mem_allocator()
 	{
-		verify (HERE, g_current_renderer);
+		ensure(g_current_renderer);
 		return g_current_renderer->get_allocator();
 	}
 
@@ -919,7 +921,7 @@ namespace vk
 
 	void advance_frame_counter()
 	{
-		verify(HERE), g_num_processed_frames <= g_num_total_frames;
+		ensure(g_num_processed_frames <= g_num_total_frames);
 		g_num_total_frames++;
 	}
 
@@ -963,7 +965,7 @@ namespace vk
 				case VK_NOT_READY:
 					continue;
 				default:
-					die_with_error(HERE, status);
+					die_with_error(status);
 					return status;
 				}
 			}
@@ -984,7 +986,7 @@ namespace vk
 			case VK_EVENT_RESET:
 				break;
 			default:
-				die_with_error(HERE, status);
+				die_with_error(status);
 				return status;
 			}
 
@@ -1011,12 +1013,16 @@ namespace vk
 	void do_query_cleanup(vk::command_buffer& cmd)
 	{
 		auto renderer = dynamic_cast<VKGSRender*>(rsx::get_current_renderer());
-		verify(HERE), renderer;
+		ensure(renderer);
 
 		renderer->emergency_query_cleanup(&cmd);
 	}
 
-	void die_with_error(const char* faulting_addr, VkResult error_code)
+	void die_with_error(VkResult error_code,
+		const char* file,
+		const char* func,
+		u32 line,
+		u32 col)
 	{
 		std::string error_message;
 		int severity = 0; //0 - die, 1 - warn, 2 - nothing
@@ -1100,7 +1106,7 @@ namespace vk
 			error_message = "Invalid external handle (VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR)";
 			break;
 		default:
-			error_message = fmt::format("Unknown Code (%Xh, %d)%s", static_cast<s32>(error_code), static_cast<s32>(error_code), faulting_addr);
+			error_message = fmt::format("Unknown Code (%Xh, %d)%s", static_cast<s32>(error_code), static_cast<s32>(error_code), src_loc{line, col, file, func});
 			break;
 		}
 
@@ -1108,9 +1114,9 @@ namespace vk
 		{
 		default:
 		case 0:
-			fmt::throw_exception("Assertion Failed! Vulkan API call failed with unrecoverable error: %s%s", error_message.c_str(), faulting_addr);
+			fmt::throw_exception("Assertion Failed! Vulkan API call failed with unrecoverable error: %s%s", error_message, src_loc{line, col, file, func});
 		case 1:
-			rsx_log.error("Vulkan API call has failed with an error but will continue: %s%s", error_message.c_str(), faulting_addr);
+			rsx_log.error("Vulkan API call has failed with an error but will continue: %s%s", error_message, src_loc{line, col, file, func});
 			break;
 		case 2:
 			break;

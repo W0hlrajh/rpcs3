@@ -66,7 +66,7 @@ namespace vk
 			CHECK_RESULT(vkCreatePipelineLayout(dev, &layout_info, nullptr, &m_pipeline_layout));
 		}
 
-		void init_program(vk::render_device &dev)
+		void init_program()
 		{
 			std::string vs =
 			{
@@ -200,7 +200,7 @@ namespace vk
 
 		void load_program(vk::command_buffer &cmd, float scale_x, float scale_y, const float *offsets, size_t nb_offsets, std::array<float, 4> color)
 		{
-			verify(HERE), m_used_descriptors < 120;
+			ensure(m_used_descriptors < 120);
 
 			VkDescriptorSetAllocateInfo alloc_info = {};
 			alloc_info.descriptorPool = m_descriptor_pool;
@@ -255,7 +255,7 @@ namespace vk
 
 		void init(vk::render_device &dev, VkRenderPass render_pass)
 		{
-			verify(HERE), render_pass != VK_NULL_HANDLE;
+			ensure(render_pass != VK_NULL_HANDLE);
 
 			//At worst case, 1 char = 16*16*8 bytes (average about 24*8), so ~256K for 128 chars. Allocating 512k for verts
 			//uniform params are 8k in size, allocating for 120 lines (max lines at 4k, one column per row. Can be expanded
@@ -266,7 +266,7 @@ namespace vk
 			m_uniform_buffer_size = 983040;
 
 			init_descriptor_set(dev);
-			init_program(dev);
+			init_program();
 
 			GlyphManager glyph_source;
 			auto points = glyph_source.generate_point_map();

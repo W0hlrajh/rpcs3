@@ -2,10 +2,6 @@
 
 #include "sceNp.h"
 
-#include "Utilities/BEType.h"
-
-#include <atomic>
-
 // Return codes
 enum SceNpClansError : u32
 {
@@ -261,5 +257,5 @@ struct SceNpClansBlacklistEntry
 
 struct sce_np_clans_manager
 {
-	std::atomic<bool> is_initialized = false;
+	atomic_t<bool> is_initialized = false;
 };

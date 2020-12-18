@@ -43,7 +43,7 @@ namespace gl
 		case rsx::primitive_type::quad_strip: return GL_TRIANGLE_STRIP;
 		case rsx::primitive_type::polygon: return GL_TRIANGLES;
 		default:
-			fmt::throw_exception("unknown primitive type" HERE);
+			fmt::throw_exception("unknown primitive type");
 		}
 	}
 
@@ -471,7 +471,7 @@ namespace gl
 		case rsx::primitive_type::polygon:
 			return false;
 		default:
-			fmt::throw_exception("unknown primitive type" HERE);
+			fmt::throw_exception("unknown primitive type");
 		}
 	}
 
@@ -553,7 +553,7 @@ namespace gl
 			}
 		}
 
-		verify("Incompatible source and destination format!" HERE), real_src->aspect() == real_dst->aspect();
+		ensure(real_src->aspect() == real_dst->aspect());
 
 		const bool is_depth_copy = (real_src->aspect() != image_aspect::color);
 		const filter interp = (linear_interpolation && !is_depth_copy) ? filter::linear : filter::nearest;

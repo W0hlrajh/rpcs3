@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "Emu/System.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/PPUThread.h"
@@ -90,6 +90,9 @@ thread_local u64 g_tls_wait_time = 0;
 thread_local u64 g_tls_wait_fail = 0;
 thread_local bool g_tls_access_violation_recovered = false;
 extern thread_local std::string(*g_tls_log_prefix)();
+
+// Report error and call std::abort(), defined in main.cpp
+[[noreturn]] void report_fatal_error(const std::string&);
 
 template <>
 void fmt_class_string<std::thread::id>::format(std::string& out, u64 arg)
@@ -1293,7 +1296,7 @@ bool handle_access_violation(u32 addr, bool is_writing, x64_context* context) no
 
 			if (op != X64OP_LOAD_BE)
 			{
-				value = se_storage<u32>::swap(value);
+				value = stx::se_storage<u32>::swap(value);
 			}
 
 			if (op == X64OP_LOAD_CMP)
@@ -1335,7 +1338,7 @@ bool handle_access_violation(u32 addr, bool is_writing, x64_context* context) no
 			}
 
 			u32 val32 = static_cast<u32>(reg_value);
-			if (!thread->write_reg(addr, op == X64OP_STORE ? se_storage<u32>::swap(val32) : val32))
+			if (!thread->write_reg(addr, op == X64OP_STORE ? stx::se_storage<u32>::swap(val32) : val32))
 			{
 				return false;
 			}
@@ -1872,7 +1875,7 @@ void thread_base::start()
 		// Receive "that" native thread handle, sent "this" thread_base
 		const u64 _self = reinterpret_cast<u64>(atomic_storage<thread_base*>::load(*tls));
 		m_thread.release(_self);
-		verify(HERE), _self != reinterpret_cast<u64>(this);
+		ensure(_self != reinterpret_cast<u64>(this));
 		atomic_storage<thread_base*>::store(*tls, this);
 		s_thread_pool[pos].notify_one();
 		return;
@@ -1880,9 +1883,10 @@ void thread_base::start()
 
 #ifdef _WIN32
 	m_thread = ::_beginthreadex(nullptr, 0, entry_point, this, CREATE_SUSPENDED, nullptr);
-	verify("thread_ctrl::start" HERE), m_thread, ::ResumeThread(reinterpret_cast<HANDLE>(+m_thread)) != -1;
+	ensure(m_thread);
+	ensure(::ResumeThread(reinterpret_cast<HANDLE>(+m_thread)) != -1);
 #else
-	verify("thread_ctrl::start" HERE), pthread_create(reinterpret_cast<pthread_t*>(&m_thread.raw()), nullptr, entry_point, this) == 0;
+	ensure(pthread_create(reinterpret_cast<pthread_t*>(&m_thread.raw()), nullptr, entry_point, this) == 0);
 #endif
 }
 
@@ -2250,7 +2254,13 @@ std::string thread_ctrl::get_name_cached()
 
 	if (!_this->m_tname.is_equal(name_cache)) [[unlikely]]
 	{
-		name_cache = _this->m_tname.load();
+		_this->m_tname.peek_op([&](const shared_ptr<std::string>& ptr)
+		{
+			if (ptr != name_cache)
+			{
+				name_cache = ptr;
+			}
+		});
 	}
 
 	return *name_cache;
@@ -2277,10 +2287,16 @@ thread_base::~thread_base()
 	}
 }
 
-bool thread_base::join() const
+bool thread_base::join(bool dtor) const
 {
+	// Check if already finished
+	if (m_sync & 2)
+	{
+		return (m_sync & 3) == 3;
+	}
+
 	// Hacked for too sleepy threads (1ms) TODO: make sure it's unneeded and remove
-	const auto timeout = Emu.IsStopped() ? atomic_wait_timeout{1'000'000} : atomic_wait_timeout::inf;
+	const auto timeout = dtor && Emu.IsStopped() ? atomic_wait_timeout{1'000'000} : atomic_wait_timeout::inf;
 
 	bool warn = false;
 	auto stamp0 = __rdtsc();
@@ -2449,8 +2465,8 @@ void thread_ctrl::detect_cpu_layout()
 		else
 		{
 			// Iterate through the buffer until a core with hyperthreading is found
-			auto ptr = reinterpret_cast<std::uintptr_t>(buffer.data());
-			const std::uintptr_t end = ptr + buffer_size;
+			auto ptr = reinterpret_cast<uptr>(buffer.data());
+			const uptr end = ptr + buffer_size;
 
 			while (ptr < end)
 			{

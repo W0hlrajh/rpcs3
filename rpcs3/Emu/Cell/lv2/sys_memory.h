@@ -2,6 +2,7 @@
 
 #include "Emu/Memory/vm_ptr.h"
 #include "Emu/IdManager.h"
+#include "Emu/Cell/ErrorCodes.h"
 
 static constexpr u64 mem_user64k_base = 0x20000000, mem_user64k_size = 0x10000000;
 static constexpr u64 mem_user1m_size = 0x20000000;

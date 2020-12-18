@@ -7,6 +7,7 @@
 #include "Emu/Cell/Common.h"
 
 #include "util/asm.hpp"
+#include "util/v128.hpp"
 
 #include <cmath>
 #include <cfenv>
@@ -93,7 +94,7 @@ namespace asmjit
 
 bool spu_interpreter::UNK(spu_thread& spu, spu_opcode_t op)
 {
-	fmt::throw_exception("Unknown/Illegal instruction (0x%08x)" HERE, op.opcode);
+	fmt::throw_exception("Unknown/Illegal instruction (0x%08x)", op.opcode);
 }
 
 
@@ -103,7 +104,7 @@ void spu_interpreter::set_interrupt_status(spu_thread& spu, spu_opcode_t op)
 	{
 		if (op.d)
 		{
-			fmt::throw_exception("Undefined behaviour" HERE);
+			fmt::throw_exception("Undefined behaviour");
 		}
 
 		spu.set_interrupt_status(true);
@@ -141,14 +142,14 @@ bool spu_interpreter::LNOP(spu_thread& spu, spu_opcode_t op)
 // This instruction must be used following a store instruction that modifies the instruction stream.
 bool spu_interpreter::SYNC(spu_thread& spu, spu_opcode_t op)
 {
-	std::atomic_thread_fence(std::memory_order_seq_cst);
+	atomic_fence_seq_cst();
 	return true;
 }
 
 // This instruction forces all earlier load, store, and channel instructions to complete before proceeding.
 bool spu_interpreter::DSYNC(spu_thread& spu, spu_opcode_t op)
 {
-	std::atomic_thread_fence(std::memory_order_seq_cst);
+	atomic_fence_seq_cst();
 	return true;
 }
 
@@ -630,7 +631,7 @@ bool spu_interpreter::CBX(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = ~(spu.gpr[op.rb]._u32[3] + spu.gpr[op.ra]._u32[3]) & 0xf;
@@ -643,7 +644,7 @@ bool spu_interpreter::CHX(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = (~(spu.gpr[op.rb]._u32[3] + spu.gpr[op.ra]._u32[3]) & 0xe) >> 1;
@@ -656,7 +657,7 @@ bool spu_interpreter::CWX(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = (~(spu.gpr[op.rb]._u32[3] + spu.gpr[op.ra]._u32[3]) & 0xc) >> 2;
@@ -669,7 +670,7 @@ bool spu_interpreter::CDX(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = (~(spu.gpr[op.rb]._u32[3] + spu.gpr[op.ra]._u32[3]) & 0x8) >> 3;
@@ -736,7 +737,7 @@ bool spu_interpreter::CBD(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = ~(op.i7 + spu.gpr[op.ra]._u32[3]) & 0xf;
@@ -749,7 +750,7 @@ bool spu_interpreter::CHD(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = (~(op.i7 + spu.gpr[op.ra]._u32[3]) & 0xe) >> 1;
@@ -762,7 +763,7 @@ bool spu_interpreter::CWD(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = (~(op.i7 + spu.gpr[op.ra]._u32[3]) & 0xc) >> 2;
@@ -775,7 +776,7 @@ bool spu_interpreter::CDD(spu_thread& spu, spu_opcode_t op)
 {
 	if (op.ra == 1 && (spu.gpr[1]._u32[3] & 0xF))
 	{
-		fmt::throw_exception("Unexpected SP value: LS:0x%05x" HERE, spu.gpr[1]._u32[3]);
+		fmt::throw_exception("Unexpected SP value: LS:0x%05x", spu.gpr[1]._u32[3]);
 	}
 
 	const s32 t = (~(op.i7 + spu.gpr[op.ra]._u32[3]) & 0x8) >> 3;
@@ -990,7 +991,7 @@ bool spu_interpreter_fast::FCGT(spu_thread& spu, spu_opcode_t op)
 
 bool spu_interpreter::DFCGT(spu_thread& spu, spu_opcode_t op)
 {
-	fmt::throw_exception("Unexpected instruction" HERE);
+	fmt::throw_exception("Unexpected instruction");
 	return true;
 }
 
@@ -1077,7 +1078,7 @@ bool spu_interpreter_fast::FCMGT(spu_thread& spu, spu_opcode_t op)
 
 bool spu_interpreter::DFCMGT(spu_thread& spu, spu_opcode_t op)
 {
-	fmt::throw_exception("Unexpected Instruction" HERE);
+	fmt::throw_exception("Unexpected Instruction");
 	return true;
 }
 
@@ -1225,7 +1226,7 @@ bool spu_interpreter_fast::FSCRWR(spu_thread& spu, spu_opcode_t op)
 
 bool spu_interpreter::DFTSV(spu_thread& spu, spu_opcode_t op)
 {
-	fmt::throw_exception("Unexpected instruction" HERE);
+	fmt::throw_exception("Unexpected instruction");
 	return true;
 }
 
@@ -1237,7 +1238,7 @@ bool spu_interpreter_fast::FCEQ(spu_thread& spu, spu_opcode_t op)
 
 bool spu_interpreter::DFCEQ(spu_thread& spu, spu_opcode_t op)
 {
-	fmt::throw_exception("Unexpected instruction" HERE);
+	fmt::throw_exception("Unexpected instruction");
 	return true;
 }
 
@@ -1281,7 +1282,7 @@ bool spu_interpreter_fast::FCMEQ(spu_thread& spu, spu_opcode_t op)
 
 bool spu_interpreter::DFCMEQ(spu_thread& spu, spu_opcode_t op)
 {
-	fmt::throw_exception("Unexpected instruction" HERE);
+	fmt::throw_exception("Unexpected instruction");
 	return true;
 }
 

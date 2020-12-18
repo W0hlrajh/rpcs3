@@ -5,6 +5,8 @@
 #include "Utilities/mutex.h"
 #include <cmath>
 
+#include "util/v128.hpp"
+
 LOG_CHANNEL(edat_log, "EDAT");
 
 // Static variables are being modified concurrently in ec.cpp, for now use a mutex
@@ -575,7 +577,7 @@ int validate_npd_hashes(const char* file_name, const u8* klicensee, NPD_HEADER *
 	int title_hash_result = 0;
 	int dev_hash_result = 0;
 
-	const s32 file_name_length = ::narrow<s32>(std::strlen(file_name), HERE);
+	const s32 file_name_length = ::narrow<s32>(std::strlen(file_name));
 	const std::size_t buf_len = 0x30 + file_name_length;
 
 	std::unique_ptr<u8[]> buf(new u8[buf_len]);

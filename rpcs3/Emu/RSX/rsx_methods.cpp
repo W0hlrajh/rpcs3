@@ -8,7 +8,6 @@
 #include "Emu/RSX/Common/BufferUtils.h"
 
 #include <thread>
-#include <atomic>
 
 namespace rsx
 {
@@ -52,7 +51,7 @@ namespace rsx
 		void semaphore_acquire(thread* rsx, u32 /*_reg*/, u32 arg)
 		{
 			rsx->sync_point_request.release(true);
-			const u32 addr = get_address(method_registers.semaphore_offset_406e(), method_registers.semaphore_context_dma_406e(), HERE);
+			const u32 addr = get_address(method_registers.semaphore_offset_406e(), method_registers.semaphore_context_dma_406e());
 
 			const auto& sema = vm::_ref<RsxSemaphore>(addr).val;
 
@@ -143,7 +142,7 @@ namespace rsx
 				rsx->sync_point_request.release(true);
 			}
 
-			const u32 addr = get_address(offset, ctxt, HERE);
+			const u32 addr = get_address(offset, ctxt);
 
 			// TODO: Check if possible to write on reservations
 			if (rsx->label_addr >> 28 != addr >> 28)
@@ -202,7 +201,7 @@ namespace rsx
 
 			const u32 addr = rsx->iomap_table.get_addr(0xf100000 + (index * 0x40));
 
-			verify(HERE), addr != umax;
+			ensure(addr != umax);
 
 			vm::_ref<atomic_t<RsxNotify>>(addr).store(
 			{
@@ -231,7 +230,7 @@ namespace rsx
 				return;
 			}
 
-			vm::_ref<RsxSemaphore>(get_address(offset, method_registers.semaphore_context_dma_4097(), HERE)).val = arg;
+			vm::_ref<RsxSemaphore>(get_address(offset, method_registers.semaphore_context_dma_4097())).val = arg;
 		}
 
 		void back_end_write_semaphore_release(thread* rsx, u32 _reg, u32 arg)
@@ -250,7 +249,7 @@ namespace rsx
 			}
 
 			const u32 val = (arg & 0xff00ff00) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff);
-			vm::_ref<RsxSemaphore>(get_address(offset, method_registers.semaphore_context_dma_4097(), HERE)).val = val;
+			vm::_ref<RsxSemaphore>(get_address(offset, method_registers.semaphore_context_dma_4097())).val = val;
 		}
 
 		/**
@@ -268,7 +267,7 @@ namespace rsx
 			static const size_t vertex_subreg = index % increment_per_array_index;
 
 			const auto vtype = vertex_data_type_from_element_type<type>::type;
-			verify(HERE), vtype != rsx::vertex_base_type::cmp;
+			ensure(vtype != rsx::vertex_base_type::cmp);
 
 			switch (vtype)
 			{
@@ -579,7 +578,7 @@ namespace rsx
 				return vm::addr_t(0);
 			}
 
-			return vm::cast(get_address(offset, location, HERE));
+			return vm::cast(get_address(offset, location));
 		}
 
 		void get_report(thread* rsx, u32 _reg, u32 arg)
@@ -922,8 +921,8 @@ namespace rsx
 				{
 					// Bit cast - optimize to mem copy
 
-					const auto dst_address = get_address(dst_offset + (x * 4) + (out_pitch * y), dst_dma, HERE);
-					const auto src_address = get_address(src_offset, CELL_GCM_LOCATION_MAIN, HERE);
+					const auto dst_address = get_address(dst_offset + (x * 4) + (out_pitch * y), dst_dma);
+					const auto src_address = get_address(src_offset, CELL_GCM_LOCATION_MAIN);
 					const auto dst = vm::_ptr<u8>(dst_address);
 					const auto src = vm::_ptr<const u8>(src_address);
 
@@ -956,8 +955,8 @@ namespace rsx
 				}
 				case blit_engine::transfer_destination_format::r5g6b5:
 				{
-					const auto dst_address = get_address(dst_offset + (x * 2) + (y * out_pitch), dst_dma, HERE);
-					const auto src_address = get_address(src_offset, CELL_GCM_LOCATION_MAIN, HERE);
+					const auto dst_address = get_address(dst_offset + (x * 2) + (y * out_pitch), dst_dma);
+					const auto src_address = get_address(src_offset, CELL_GCM_LOCATION_MAIN);
 					const auto dst = vm::_ptr<u16>(dst_address);
 					const auto src = vm::_ptr<const u32>(src_address);
 
@@ -995,7 +994,7 @@ namespace rsx
 				}
 				default:
 				{
-					fmt::throw_exception("Unreachable" HERE);
+					fmt::throw_exception("Unreachable");
 				}
 				}
 
@@ -1043,7 +1042,7 @@ namespace rsx
 			if (in_w == 0 || in_h == 0)
 			{
 				// Input cant be an empty region
-				fmt::throw_exception("NV3089_IMAGE_IN_SIZE: Invalid blit dimensions passed (in_w=%d, in_h=%d)" HERE, in_w, in_h);
+				fmt::throw_exception("NV3089_IMAGE_IN_SIZE: Invalid blit dimensions passed (in_w=%d, in_h=%d)", in_w, in_h);
 			}
 
 			u16 clip_x = method_registers.blit_engine_clip_x();
@@ -1066,7 +1065,7 @@ namespace rsx
 
 			if (operation != rsx::blit_engine::transfer_operation::srccopy)
 			{
-				fmt::throw_exception("NV3089_IMAGE_IN_SIZE: unknown operation (%d)" HERE, static_cast<u8>(operation));
+				fmt::throw_exception("NV3089_IMAGE_IN_SIZE: unknown operation (%d)", static_cast<u8>(operation));
 			}
 
 			const u32 src_offset = method_registers.blit_engine_input_offset();
@@ -1147,8 +1146,8 @@ namespace rsx
 			const u32 in_offset = in_x * in_bpp + in_pitch * in_y;
 			const u32 out_offset = out_x * out_bpp + out_pitch * out_y;
 
-			const u32 src_address = get_address(src_offset, src_dma, HERE);
-			const u32 dst_address = get_address(dst_offset, dst_dma, HERE);
+			const u32 src_address = get_address(src_offset, src_dma);
+			const u32 dst_address = get_address(dst_offset, dst_dma);
 
 			const u32 src_line_length = (in_w * in_bpp);
 
@@ -1183,7 +1182,7 @@ namespace rsx
 			if (dst_color_format != rsx::blit_engine::transfer_destination_format::r5g6b5 &&
 				dst_color_format != rsx::blit_engine::transfer_destination_format::a8r8g8b8)
 			{
-				fmt::throw_exception("NV3089_IMAGE_IN_SIZE: unknown dst_color_format (%d)" HERE, static_cast<u8>(dst_color_format));
+				fmt::throw_exception("NV3089_IMAGE_IN_SIZE: unknown dst_color_format (%d)", static_cast<u8>(dst_color_format));
 			}
 
 			if (src_color_format != rsx::blit_engine::transfer_source_format::r5g6b5 &&
@@ -1197,7 +1196,7 @@ namespace rsx
 				else
 				{
 					// TODO: Support more formats
-					fmt::throw_exception("NV3089_IMAGE_IN_SIZE: unknown src_color_format (%d)" HERE, static_cast<u8>(src_color_format));
+					fmt::throw_exception("NV3089_IMAGE_IN_SIZE: unknown src_color_format (%d)", static_cast<u8>(src_color_format));
 				}
 			}
 
@@ -1511,8 +1510,8 @@ namespace rsx
 			u32 dst_dma = method_registers.nv0039_output_location();
 
 			const bool is_block_transfer = (in_pitch == out_pitch && out_pitch + 0u == line_length);
-			const auto read_address = get_address(src_offset, src_dma, HERE);
-			const auto write_address = get_address(dst_offset, dst_dma, HERE);
+			const auto read_address = get_address(src_offset, src_dma);
+			const auto write_address = get_address(dst_offset, dst_dma);
 			const auto read_length = in_pitch * (line_count - 1) + line_length;
 			const auto write_length = out_pitch * (line_count - 1) + line_length;
 
@@ -1593,7 +1592,7 @@ namespace rsx
 
 	void flip_command(thread* rsx, u32, u32 arg)
 	{
-		verify(HERE), rsx->isHLE;
+		ensure(rsx->isHLE);
 		rsx->reset();
 		rsx->request_emu_flip(arg);
 	}
@@ -2655,7 +2654,7 @@ namespace rsx
 				result |= vertex_base_changed;
 				break;
 			default:
-				fmt::throw_exception("Unreachable" HERE);
+				fmt::throw_exception("Unreachable");
 			}
 		}
 

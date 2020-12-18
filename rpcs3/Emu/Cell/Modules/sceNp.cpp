@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "Emu/System.h"
 #include "Emu/VFS.h"
 #include "Emu/Cell/PPUModule.h"
@@ -11,8 +11,11 @@
 #include "sceNp.h"
 #include "cellSysutil.h"
 
+#include "Emu/Cell/lv2/sys_time.h"
 #include "Emu/NP/np_handler.h"
 #include "Emu/NP/np_contexts.h"
+
+#include "util/v128.hpp"
 
 LOG_CHANNEL(sceNp);
 
@@ -2519,9 +2522,18 @@ error_code sceNpManagerGetNetworkTime(vm::ptr<CellRtcTick> pTick)
 		return SCE_NP_ERROR_INVALID_STATE;
 	}
 
-	auto now    = std::chrono::system_clock::now();
-	// That's assuming epoch is unix epoch which is not actually standardized, god I hate you C++ std
-	pTick->tick = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count() + (62135596800 * 1000 * 1000);
+	vm::var<s64> sec;
+	vm::var<s64> nsec;
+
+	error_code ret = sys_time_get_current_time(sec, nsec);
+
+	if (ret != CELL_OK)
+	{
+		return ret;
+	}
+
+	// Taken from cellRtc
+	pTick->tick = *nsec / 1000 + *sec * cellRtcGetTickResolution() + 62135596800000000ULL;
 
 	return CELL_OK;
 }

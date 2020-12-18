@@ -7,6 +7,7 @@
 #endif
 
 #include "Utilities/sync.h"
+#include "Utilities/StrFmt.h"
 
 #include <utility>
 #include <mutex>
@@ -24,7 +25,7 @@
 static constexpr std::size_t s_hashtable_size = 1u << 17;
 
 // Reference counter combined with shifted pointer (which is assumed to be 47 bit)
-static constexpr std::uintptr_t s_ref_mask = (1u << 17) - 1;
+static constexpr uptr s_ref_mask = (1u << 17) - 1;
 
 // Fix for silly on-first-use initializer
 static bool s_null_wait_cb(const void*, u64, u64){ return true; };
@@ -71,8 +72,7 @@ ptr_cmp(const void* data, u32 _size, __m128i old128, __m128i mask128, atomic_wai
 		case 8: new_value = reinterpret_cast<const atomic_t<u64>*>(data)->load(); break;
 		default:
 		{
-			fprintf(stderr, "ptr_cmp(): bad size (arg=0x%x)" HERE "\n", _size);
-			std::abort();
+			fmt::throw_exception("Bad size (arg=0x%x)", _size);
 		}
 		}
 
@@ -160,7 +160,7 @@ ptr_cmp(const void* data, u32 _size, __m128i old128, __m128i mask128, atomic_wai
 		}
 		default:
 		{
-			fmt::raw_error("ptr_cmp(): unrecognized atomic wait operation.");
+			fmt::throw_exception("ptr_cmp(): unrecognized atomic wait operation.");
 		}
 		}
 	}
@@ -181,7 +181,7 @@ ptr_cmp(const void* data, u32 _size, __m128i old128, __m128i mask128, atomic_wai
 	}
 	else if (size == 16)
 	{
-		fmt::raw_error("ptr_cmp(): no alternative operations are supported for 16-byte atomic wait yet.");
+		fmt::throw_exception("ptr_cmp(): no alternative operations are supported for 16-byte atomic wait yet.");
 	}
 
 	if (flag & op_flag::inverse)
@@ -236,7 +236,7 @@ cmp_mask(u32 size1, __m128i mask1, __m128i val1, u32 size2, __m128i mask2, __m12
 
 	if (flag != op::eq && flag != (op::eq | op_flag::inverse))
 	{
-		fmt::raw_error("cmp_mask(): no operations are supported for notification with forced value yet.");
+		fmt::throw_exception("cmp_mask(): no operations are supported for notification with forced value yet.");
 	}
 
 	if (size <= 8)
@@ -258,8 +258,7 @@ cmp_mask(u32 size1, __m128i mask1, __m128i val1, u32 size2, __m128i mask2, __m12
 	}
 	else
 	{
-		fprintf(stderr, "cmp_mask(): bad size (size1=%u, size2=%u)" HERE "\n", size1, size2);
-		std::abort();
+		fmt::throw_exception("bad size (size1=%u, size2=%u)", size1, size2);
 	}
 
 	return !(flag & op_flag::inverse);
@@ -344,7 +343,7 @@ namespace
 		un_t<std::mutex> mtx;
 #endif
 
-		void init(std::uintptr_t iptr)
+		void init(uptr iptr)
 		{
 #ifdef _WIN32
 			tid = GetCurrentThreadId();
@@ -357,7 +356,7 @@ namespace
 			mtx.init(mtx);
 #endif
 
-			verify(HERE), !ptr_ref.exchange((iptr << 17) | 1);
+			ensure(!ptr_ref.exchange((iptr << 17) | 1));
 		}
 
 		void destroy()
@@ -562,7 +561,7 @@ static u32
 #ifdef _WIN32
 __vectorcall
 #endif
-cond_alloc(std::uintptr_t iptr, __m128i mask, u32 tls_slot = -1)
+cond_alloc(uptr iptr, __m128i mask, u32 tls_slot = -1)
 {
 	// Try to get cond from tls slot instead
 	u16* ptls = tls_slot >= std::size(s_tls_conds.cond) ? nullptr : s_tls_conds.cond + tls_slot;
@@ -634,15 +633,14 @@ cond_alloc(std::uintptr_t iptr, __m128i mask, u32 tls_slot = -1)
 		return id;
 	}
 
-	fmt::raw_error("Thread semaphore limit " STRINGIZE(UINT16_MAX) " reached in atomic wait.");
+	fmt::throw_exception("Thread semaphore limit (65535) reached in atomic wait.");
 }
 
 static void cond_free(u32 cond_id, u32 tls_slot = -1)
 {
 	if (cond_id - 1 >= u32{UINT16_MAX}) [[unlikely]]
 	{
-		fprintf(stderr, "cond_free(): bad id %u" HERE "\n", cond_id);
-		std::abort();
+		fmt::throw_exception("bad id %u", cond_id);
 	}
 
 	const auto cond = s_cond_list + cond_id;
@@ -650,7 +648,7 @@ static void cond_free(u32 cond_id, u32 tls_slot = -1)
 	// Dereference, destroy on last ref
 	const bool last = cond->ptr_ref.atomic_op([](u64& val)
 	{
-		verify(HERE), val & s_ref_mask;
+		ensure(val & s_ref_mask);
 
 		val--;
 
@@ -715,7 +713,7 @@ static cond_handle*
 #ifdef _WIN32
 __vectorcall
 #endif
-cond_id_lock(u32 cond_id, u32 size, __m128i mask, u64 thread_id = 0, std::uintptr_t iptr = 0)
+cond_id_lock(u32 cond_id, u32 size, __m128i mask, u64 thread_id = 0, uptr iptr = 0)
 {
 	if (cond_id - 1 < u32{UINT16_MAX})
 	{
@@ -767,7 +765,7 @@ cond_id_lock(u32 cond_id, u32 size, __m128i mask, u64 thread_id = 0, std::uintpt
 
 		if ((old & s_ref_mask) == s_ref_mask)
 		{
-			fmt::raw_error("Reference count limit (131071) reached in an atomic notifier.");
+			fmt::throw_exception("Reference count limit (131071) reached in an atomic notifier.");
 		}
 	}
 
@@ -802,12 +800,12 @@ namespace
 		// Allocation pool, pointers to allocated semaphores
 		atomic_t<u16> slots[max_threads];
 
-		static atomic_t<u16>* slot_alloc(std::uintptr_t ptr) noexcept;
+		static atomic_t<u16>* slot_alloc(uptr ptr) noexcept;
 
-		static void slot_free(std::uintptr_t ptr, atomic_t<u16>* slot, u32 tls_slot) noexcept;
+		static void slot_free(uptr ptr, atomic_t<u16>* slot, u32 tls_slot) noexcept;
 
 		template <typename F>
-		static auto slot_search(std::uintptr_t iptr, u32 size, u64 thread_id, __m128i mask, F func) noexcept;
+		static auto slot_search(uptr iptr, u32 size, u64 thread_id, __m128i mask, F func) noexcept;
 	};
 
 	static_assert(sizeof(root_info) == 64);
@@ -833,7 +831,7 @@ namespace
 		u32 id;
 
 		// Initialize: PRNG on iptr, split into two 16 bit chunks, choose first chunk
-		explicit hash_engine(std::uintptr_t iptr)
+		explicit hash_engine(uptr iptr)
 			: init(rng(iptr)())
 			, r0(static_cast<u16>(init >> 48))
 			, r1(static_cast<u16>(init >> 32))
@@ -885,7 +883,7 @@ u64 atomic_wait::get_unique_tsc()
 	});
 }
 
-atomic_t<u16>* root_info::slot_alloc(std::uintptr_t ptr) noexcept
+atomic_t<u16>* root_info::slot_alloc(uptr ptr) noexcept
 {
 	atomic_t<u16>* slot = nullptr;
 
@@ -898,7 +896,7 @@ atomic_t<u16>* root_info::slot_alloc(std::uintptr_t ptr) noexcept
 			// Increment reference counter on every hashtable slot we attempt to allocate on
 			if (bits.ref == UINT16_MAX)
 			{
-				fmt::raw_error("Thread limit " STRINGIZE(UINT16_MAX) " reached for a single hashtable slot.");
+				fmt::throw_exception("Thread limit (65535) reached for a single hashtable slot.");
 				return nullptr;
 			}
 
@@ -931,7 +929,7 @@ atomic_t<u16>* root_info::slot_alloc(std::uintptr_t ptr) noexcept
 
 		if (limit == max_distance) [[unlikely]]
 		{
-			fmt::raw_error("Distance limit (500) exceeded for the atomic wait hashtable.");
+			fmt::throw_exception("Distance limit (500) exceeded for the atomic wait hashtable.");
 			return nullptr;
 		}
 	}
@@ -939,17 +937,17 @@ atomic_t<u16>* root_info::slot_alloc(std::uintptr_t ptr) noexcept
 	return slot;
 }
 
-void root_info::slot_free(std::uintptr_t iptr, atomic_t<u16>* slot, u32 tls_slot) noexcept
+void root_info::slot_free(uptr iptr, atomic_t<u16>* slot, u32 tls_slot) noexcept
 {
-	const auto begin = reinterpret_cast<std::uintptr_t>(std::begin(s_hashtable));
+	const auto begin = reinterpret_cast<uptr>(std::begin(s_hashtable));
 
-	const auto end = reinterpret_cast<std::uintptr_t>(std::end(s_hashtable));
+	const auto end = reinterpret_cast<uptr>(std::end(s_hashtable));
 
-	const auto ptr = reinterpret_cast<std::uintptr_t>(slot) - begin;
+	const auto ptr = reinterpret_cast<uptr>(slot) - begin;
 
 	if (ptr >= sizeof(s_hashtable))
 	{
-		fmt::raw_error("Failed to find slot in hashtable slot deallocation." HERE);
+		fmt::throw_exception("Failed to find slot in hashtable slot deallocation.");
 		return;
 	}
 
@@ -957,13 +955,13 @@ void root_info::slot_free(std::uintptr_t iptr, atomic_t<u16>* slot, u32 tls_slot
 
 	if (!(slot >= _this->slots && slot < std::end(_this->slots)))
 	{
-		fmt::raw_error("Failed to find slot in hashtable slot deallocation." HERE);
+		fmt::throw_exception("Failed to find slot in hashtable slot deallocation.");
 		return;
 	}
 
 	const u32 diff = static_cast<u32>(slot - _this->slots);
 
-	verify(HERE), slot == &_this->slots[diff];
+	ensure(slot == &_this->slots[diff]);
 
 	const u32 cond_id = slot->exchange(0);
 
@@ -977,7 +975,7 @@ void root_info::slot_free(std::uintptr_t iptr, atomic_t<u16>* slot, u32 tls_slot
 		// Reset reference counter and allocation bit in every slot
 		curr->bits.atomic_op([&](slot_allocator& bits)
 		{
-			verify(HERE), bits.ref--;
+			ensure(bits.ref--);
 
 			if (_this == curr.current())
 			{
@@ -993,7 +991,7 @@ void root_info::slot_free(std::uintptr_t iptr, atomic_t<u16>* slot, u32 tls_slot
 }
 
 template <typename F>
-FORCE_INLINE auto root_info::slot_search(std::uintptr_t iptr, u32 size, u64 thread_id, __m128i mask, F func) noexcept
+FORCE_INLINE auto root_info::slot_search(uptr iptr, u32 size, u64 thread_id, __m128i mask, F func) noexcept
 {
 	u32 index = 0;
 	u32 total = 0;
@@ -1056,11 +1054,11 @@ atomic_wait_engine::wait(const void* data, u32 size, __m128i old_value, u64 time
 		return;
 	}
 
-	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data) & (~s_ref_mask >> 17);
+	const uptr iptr = reinterpret_cast<uptr>(data) & (~s_ref_mask >> 17);
 
 	uint ext_size = 0;
 
-	std::uintptr_t iptr_ext[atomic_wait::max_list - 1]{};
+	uptr iptr_ext[atomic_wait::max_list - 1]{};
 
 	if (ext) [[unlikely]]
 	{
@@ -1068,18 +1066,18 @@ atomic_wait_engine::wait(const void* data, u32 size, __m128i old_value, u64 time
 		{
 			if (data == e->data)
 			{
-				fmt::raw_error("Address duplication in atomic_wait::list" HERE);
+				fmt::throw_exception("Address duplication in atomic_wait::list");
 			}
 
 			for (u32 j = 0; j < ext_size; j++)
 			{
 				if (e->data == ext[j].data)
 				{
-					fmt::raw_error("Address duplication in atomic_wait::list" HERE);
+					fmt::throw_exception("Address duplication in atomic_wait::list");
 				}
 			}
 
-			iptr_ext[ext_size] = reinterpret_cast<std::uintptr_t>(e->data) & (~s_ref_mask >> 17);
+			iptr_ext[ext_size] = reinterpret_cast<uptr>(e->data) & (~s_ref_mask >> 17);
 			ext_size++;
 		}
 	}
@@ -1146,7 +1144,7 @@ atomic_wait_engine::wait(const void* data, u32 size, __m128i old_value, u64 time
 	std::unique_lock lock(*cond->mtx.get());
 #else
 	if (ext_size)
-		_mm_mfence();
+		atomic_fence_seq_cst();
 #endif
 
 	// Can skip unqueue process if true
@@ -1226,7 +1224,7 @@ atomic_wait_engine::wait(const void* data, u32 size, __m128i old_value, u64 time
 			default:
 			{
 				SetLastError(status);
-				fmt::raw_verify_error("Unexpected NtWaitForAlertByThreadId result.", nullptr, 0);
+				ensure(false); // Unexpected result
 			}
 			}
 		}
@@ -1308,7 +1306,7 @@ __vectorcall
 #endif
 alert_sema(u32 cond_id, const void* data, u64 tid, u32 size, __m128i mask, __m128i phantom)
 {
-	verify(HERE), cond_id;
+	ensure(cond_id);
 
 	const auto cond = s_cond_list + cond_id;
 
@@ -1483,7 +1481,7 @@ bool atomic_wait_engine::raw_notify(const void* data, u64 thread_id)
 		return false;
 	}
 
-	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data) & (~s_ref_mask >> 17);
+	const uptr iptr = reinterpret_cast<uptr>(data) & (~s_ref_mask >> 17);
 
 	if (s_tls_notify_cb)
 		s_tls_notify_cb(data, 0);
@@ -1522,7 +1520,7 @@ __vectorcall
 #endif
 atomic_wait_engine::notify_one(const void* data, u32 size, __m128i mask, __m128i new_value)
 {
-	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data) & (~s_ref_mask >> 17);
+	const uptr iptr = reinterpret_cast<uptr>(data) & (~s_ref_mask >> 17);
 
 	if (s_tls_notify_cb)
 		s_tls_notify_cb(data, 0);
@@ -1551,7 +1549,7 @@ __vectorcall
 #endif
 atomic_wait_engine::notify_all(const void* data, u32 size, __m128i mask)
 {
-	const std::uintptr_t iptr = reinterpret_cast<std::uintptr_t>(data) & (~s_ref_mask >> 17);
+	const uptr iptr = reinterpret_cast<uptr>(data) & (~s_ref_mask >> 17);
 
 	if (s_tls_notify_cb)
 		s_tls_notify_cb(data, 0);

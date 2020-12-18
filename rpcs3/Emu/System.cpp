@@ -5,6 +5,7 @@
 #include "Emu/System.h"
 #include "Emu/perf_meter.hpp"
 
+#include "Emu/Cell/ErrorCodes.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/PPUCallback.h"
 #include "Emu/Cell/PPUOpcodes.h"
@@ -35,6 +36,7 @@
 #include "util/logs.hpp"
 
 #include "cereal/archives/binary.hpp"
+#include <cereal/types/unordered_map.hpp>
 
 #include <thread>
 #include <typeinfo>
@@ -81,6 +83,9 @@ atomic_t<u32> g_progr_ftotal{0};
 atomic_t<u32> g_progr_fdone{0};
 atomic_t<u32> g_progr_ptotal{0};
 atomic_t<u32> g_progr_pdone{0};
+
+// Report error and call std::abort(), defined in main.cpp
+[[noreturn]] void report_fatal_error(const std::string&);
 
 namespace
 {
@@ -1059,11 +1064,6 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 			sys_log.notice("Hdd1: %s", vfs::get("/dev_hdd1"));
 		}
 
-		if (!fs::is_file(g_cfg.vfs.get_dev_flash() + "sys/external/liblv2.sprx"))
-		{
-			return game_boot_result::firmware_missing;
-		}
-
 		// Special boot mode (directory scan)
 		if (!add_only && fs::is_dir(m_path))
 		{
@@ -1077,10 +1077,20 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 			// Force LLVM recompiler
 			g_cfg.core.ppu_decoder.from_default();
 
-			// Force lib loading mode
-			g_cfg.core.lib_loading.from_string("Manually load selected libraries");
-			verify(HERE), g_cfg.core.lib_loading == lib_loading_type::manual;
-			g_cfg.core.load_libraries.from_default();
+			// Force LLE lib loading mode
+			g_cfg.core.libraries_control.set_set([]()
+			{
+				std::set<std::string> set;
+
+				extern const std::map<std::string_view, int> g_prx_list;
+
+				for (const auto& lib : g_prx_list)
+				{
+					set.emplace(std::string(lib.first) + ":lle");
+				}
+
+				return set;
+			}());
 
 			// Fake arg (workaround)
 			argv.resize(1);
@@ -1140,11 +1150,6 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 						// Check .sprx filename
 						if (fmt::to_upper(entry.name).ends_with(".SPRX"))
 						{
-							if (entry.name == "libfs_155.sprx")
-							{
-								continue;
-							}
-
 							// Get full path
 							file_queue.emplace_back(dir_queue[i] + entry.name, 0);
 							g_progr_ftotal++;
@@ -1185,7 +1190,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 				else
 				{
 					// Workaround for analyser glitches
-					verify(HERE), vm::falloc(0x10000, 0xf0000, vm::main);
+					ensure(vm::falloc(0x10000, 0xf0000, vm::main));
 				}
 
 				atomic_t<std::size_t> fnext = 0;
@@ -1219,6 +1224,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 							{
 								lock.unlock();
 								ppu_initialize(*prx);
+								idm::remove<lv2_obj, lv2_prx>(idm::last_id());
 								lock.lock();
 								ppu_unload_prx(*prx);
 								g_progr_fdone++;
@@ -1360,10 +1366,6 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 			sys_log.notice("PS1 Game: %s, %s", m_title_id, m_title);
 
 			const std::string game_path = "/dev_hdd0/game/" + m_path.substr(hdd0_game.size(), 9);
-
-			sys_log.notice("Forcing manual lib loading mode");
-			g_cfg.core.lib_loading.from_string(fmt::format("%s", lib_loading_type::manual));
-			g_cfg.core.load_libraries.from_list({});
 
 			argv.resize(9);
 			argv[0] = "/dev_flash/ps1emu/ps1_newemu.self";
@@ -1682,6 +1684,15 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 		{
 			if (ppu_exec == elf_error::ok)
 			{
+				if (!fs::is_file(g_cfg.vfs.get_dev_flash() + "sys/external/liblv2.sprx"))
+				{
+					if (!GetCallbacks().on_missing_fw())
+					{
+						Stop();
+						return game_boot_result::firmware_missing;
+					}
+				}
+
 				Run(true);
 			}
 

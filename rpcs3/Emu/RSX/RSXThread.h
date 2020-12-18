@@ -4,7 +4,6 @@
 #include <deque>
 #include <variant>
 #include <stack>
-#include <atomic>
 
 #include "GCM.h"
 #include "rsx_cache.h"
@@ -13,9 +12,8 @@
 #include "RSXOffload.h"
 #include "RSXVertexProgram.h"
 #include "RSXFragmentProgram.h"
-#include "rsx_methods.h"
 #include "rsx_utils.h"
-#include "Common/texture_cache_utils.h"
+#include "Common/texture_cache_types.h"
 
 #include "Utilities/Thread.h"
 #include "Utilities/geometry.h"
@@ -29,7 +27,7 @@
 extern u64 get_guest_system_time();
 extern u64 get_system_time();
 
-extern std::atomic<bool> g_user_asked_for_frame_capture;
+extern atomic_t<bool> g_user_asked_for_frame_capture;
 extern rsx::frame_trace_data frame_debug;
 extern rsx::frame_capture_data frame_capture;
 
@@ -83,7 +81,7 @@ namespace rsx
 		template<bool IsFullLock>
 		void unlock(u32 addr, u32 len) noexcept
 		{
-			ASSERT(len >= 1);
+			ensure(len >= 1);
 			const u32 end = addr + len - 1;
 
 			for (u32 block = (addr >> 20); block <= (end >> 20); ++block)
@@ -173,8 +171,11 @@ namespace rsx
 
 	u32 get_vertex_type_size_on_host(vertex_base_type type, u32 size);
 
-	// TODO: Replace with std::source_location in c++20
-	u32 get_address(u32 offset, u32 location, const char* from);
+	u32 get_address(u32 offset, u32 location,
+		u32 line = __builtin_LINE(),
+		u32 col = __builtin_COLUMN(),
+		const char* file = __builtin_FILE(),
+		const char* func = __builtin_FUNCTION());
 
 	struct tiled_region
 	{
@@ -287,7 +288,7 @@ namespace rsx
 				}
 			}
 
-			verify(HERE), _max_index >= _min_index;
+			ensure(_max_index >= _min_index);
 			return { _min_index, (_max_index - _min_index) + 1 };
 		}
 	};
@@ -353,7 +354,7 @@ namespace rsx
 				}
 				default:
 				{
-					fmt::throw_exception("Unreachable" HERE);
+					fmt::throw_exception("Unreachable");
 				}
 				}
 			}
@@ -771,6 +772,9 @@ namespace rsx
 		RSXVertexProgram current_vertex_program = {};
 		RSXFragmentProgram current_fragment_program = {};
 
+		// Runs shader prefetch and resolves pipeline status flags
+		void analyse_current_rsx_pipeline();
+
 		// Prefetch and analyze the currently active fragment program ucode
 		void prefetch_fragment_program();
 
@@ -781,8 +785,6 @@ namespace rsx
 
 		/**
 		 * Gets current fragment program and associated fragment state
-		 * get_surface_info is a helper takes 2 parameters: rsx_texture_address and surface_is_depth
-		 * returns whether surface is a render target and surface pitch in native format
 		 */
 		void get_current_fragment_program(const std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count>& sampler_descriptors);
 

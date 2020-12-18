@@ -26,9 +26,12 @@ private:
 
 	QFontMetrics* m_fontMetrics;
 
+	std::string getHeaderAtAddr(u32 addr);
+	void scroll(s32 steps);
+
 public:
 	bool exit;
-	memory_viewer_panel(QWidget* parent);
+	memory_viewer_panel(QWidget* parent, u32 addr = 0);
 	~memory_viewer_panel();
 
 	void wheelEvent(QWheelEvent *event) override;

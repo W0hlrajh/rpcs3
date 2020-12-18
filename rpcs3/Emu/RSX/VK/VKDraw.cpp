@@ -1,6 +1,7 @@
 #include "stdafx.h"
-#include "VKGSRender.h"
 #include "../Common/BufferUtils.h"
+#include "../rsx_methods.h"
+#include "VKGSRender.h"
 
 namespace vk
 {
@@ -16,7 +17,7 @@ namespace vk
 			return VK_IMAGE_VIEW_TYPE_CUBE;
 		case rsx::texture_dimension_extended::texture_dimension_3d:
 			return VK_IMAGE_VIEW_TYPE_3D;
-		default: ASSUME(0);
+		default: fmt::throw_exception("Unreachable");
 		};
 	}
 
@@ -33,7 +34,7 @@ namespace vk
 		case rsx::comparison_function::not_equal: return VK_COMPARE_OP_NOT_EQUAL;
 		case rsx::comparison_function::always: return VK_COMPARE_OP_ALWAYS;
 		default:
-			fmt::throw_exception("Unknown compare op: 0x%x" HERE, static_cast<u32>(op));
+			fmt::throw_exception("Unknown compare op: 0x%x", static_cast<u32>(op));
 		}
 	}
 }
@@ -140,17 +141,20 @@ void VKGSRender::update_draw_state()
 
 void VKGSRender::load_texture_env()
 {
-	//Load textures
-	bool update_framebuffer_sourced = false;
+	// Load textures
 	bool check_for_cyclic_refs = false;
+	auto check_surface_cache_sampler = [&](auto descriptor)
+	{
+		if (!m_texture_cache.test_if_descriptor_expired(*m_current_command_buffer, m_rtts, descriptor))
+		{
+			check_for_cyclic_refs |= descriptor->is_cyclic_reference;
+			return true;
+		}
+
+		return false;
+	};
 
 	std::lock_guard lock(m_sampler_mutex);
-
-	if (surface_store_tag != m_rtts.cache_tag) [[unlikely]]
-	{
-		update_framebuffer_sourced = true;
-		surface_store_tag = m_rtts.cache_tag;
-	}
 
 	for (u32 textures_ref = current_fp_metadata.referenced_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)
 	{
@@ -160,11 +164,9 @@ void VKGSRender::load_texture_env()
 		if (!fs_sampler_state[i])
 			fs_sampler_state[i] = std::make_unique<vk::texture_cache::sampled_image_descriptor>();
 
-		if (m_samplers_dirty || m_textures_dirty[i] ||
-			(update_framebuffer_sourced && fs_sampler_state[i]->upload_context == rsx::texture_upload_context::framebuffer_storage))
+		auto sampler_state = static_cast<vk::texture_cache::sampled_image_descriptor*>(fs_sampler_state[i].get());
+		if (m_samplers_dirty || m_textures_dirty[i] || !check_surface_cache_sampler(sampler_state))
 		{
-			auto sampler_state = static_cast<vk::texture_cache::sampled_image_descriptor*>(fs_sampler_state[i].get());
-
 			if (rsx::method_registers.fragment_textures[i].enabled())
 			{
 				check_heap_status(VK_HEAP_CHECK_TEXTURE_UPLOAD_STORAGE);
@@ -300,11 +302,9 @@ void VKGSRender::load_texture_env()
 		if (!vs_sampler_state[i])
 			vs_sampler_state[i] = std::make_unique<vk::texture_cache::sampled_image_descriptor>();
 
-		if (m_samplers_dirty || m_vertex_textures_dirty[i] ||
-			(update_framebuffer_sourced && vs_sampler_state[i]->upload_context == rsx::texture_upload_context::framebuffer_storage))
+		auto sampler_state = static_cast<vk::texture_cache::sampled_image_descriptor*>(vs_sampler_state[i].get());
+		if (m_samplers_dirty || m_vertex_textures_dirty[i] || !check_surface_cache_sampler(sampler_state))
 		{
-			auto sampler_state = static_cast<vk::texture_cache::sampled_image_descriptor*>(vs_sampler_state[i].get());
-
 			if (rsx::method_registers.vertex_textures[i].enabled())
 			{
 				check_heap_status(VK_HEAP_CHECK_TEXTURE_UPLOAD_STORAGE);
@@ -387,15 +387,15 @@ void VKGSRender::bind_texture_env()
 				//case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
 					break;
 				case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::blit_engine_dst;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::blit_engine_dst);
 					raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 					break;
 				case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::blit_engine_src;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::blit_engine_src);
 					raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 					break;
 				case VK_IMAGE_LAYOUT_GENERAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage);
 					if (!sampler_state->is_cyclic_reference)
 					{
 						// This was used in a cyclic ref before, but is missing a barrier
@@ -426,7 +426,7 @@ void VKGSRender::bind_texture_env()
 					break;
 				case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
 				case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage);
 					raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 					break;
 				}
@@ -527,15 +527,15 @@ void VKGSRender::bind_texture_env()
 		//case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
 			break;
 		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::blit_engine_dst;
+			ensure(sampler_state->upload_context == rsx::texture_upload_context::blit_engine_dst);
 			raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 			break;
 		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::blit_engine_src;
+			ensure(sampler_state->upload_context == rsx::texture_upload_context::blit_engine_src);
 			raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 			break;
 		case VK_IMAGE_LAYOUT_GENERAL:
-			verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage;
+			ensure(sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage);
 			if (!sampler_state->is_cyclic_reference)
 			{
 				// Custom barrier, see similar block in FS stage
@@ -565,7 +565,7 @@ void VKGSRender::bind_texture_env()
 			break;
 		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
 		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-			verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage;
+			ensure(sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage);
 			raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 			break;
 		}
@@ -635,15 +635,15 @@ void VKGSRender::bind_interpreter_texture_env()
 					//case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
 					break;
 				case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::blit_engine_dst;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::blit_engine_dst);
 					raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 					break;
 				case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::blit_engine_src;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::blit_engine_src);
 					raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 					break;
 				case VK_IMAGE_LAYOUT_GENERAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage);
 					if (!sampler_state->is_cyclic_reference)
 					{
 						// This was used in a cyclic ref before, but is missing a barrier
@@ -674,7 +674,8 @@ void VKGSRender::bind_interpreter_texture_env()
 					break;
 				case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
 				case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-					verify(HERE), sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage, !sampler_state->is_cyclic_reference;
+					ensure(sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage);
+					ensure(!sampler_state->is_cyclic_reference);
 					raw->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 					break;
 				}
@@ -721,7 +722,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		for (auto &info : m_vertex_layout.interleaved_blocks)
 		{
 			const auto vertex_base_offset = rsx::method_registers.vertex_data_base_offset();
-			info.real_offset_address = rsx::get_address(rsx::get_vertex_offset_from_base(vertex_base_offset, info.base_offset), info.memory_location, HERE);
+			info.real_offset_address = rsx::get_address(rsx::get_vertex_offset_from_base(vertex_base_offset, info.base_offset), info.memory_location);
 		}
 	}
 
@@ -794,7 +795,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	// Update vertex fetch parameters
 	update_vertex_env(sub_index, upload_info);
 
-	verify(HERE), m_vertex_layout_storage;
+	ensure(m_vertex_layout_storage);
 	if (update_descriptors)
 	{
 		m_program->bind_uniform(persistent_buffer, binding_table.vertex_buffers_first_bind_slot, m_current_frame->descriptor_set);
@@ -804,9 +805,11 @@ void VKGSRender::emit_geometry(u32 sub_index)
 
 	if (!m_current_subdraw_id++)
 	{
-		vkCmdBindPipeline(*m_current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_program->pipeline);
 		update_draw_state();
 		begin_render_pass();
+
+		// Bind pipeline after starting the renderpass to work around some validation layer spam about format mismatch
+		vkCmdBindPipeline(*m_current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_program->pipeline);
 
 		if (cond_render_ctrl.hw_cond_active && m_device->get_conditional_render_support())
 		{
@@ -893,6 +896,8 @@ void VKGSRender::end()
 		return;
 	}
 
+	m_profiler.start();
+
 	// Check for frame resource status here because it is possible for an async flip to happen between begin/end
 	if (m_current_frame->flags & frame_context_state::dirty) [[unlikely]]
 	{
@@ -910,12 +915,13 @@ void VKGSRender::end()
 			m_current_frame->used_descriptors = 0;
 		}
 
-		verify(HERE), !m_current_frame->swap_command_buffer;
+		ensure(!m_current_frame->swap_command_buffer);
 
 		m_current_frame->flags &= ~frame_context_state::dirty;
 	}
 
-	m_profiler.start();
+	analyse_current_rsx_pipeline();
+	m_frame_stats.setup_time += m_profiler.duration();
 
 	load_texture_env();
 	m_frame_stats.textures_upload_time += m_profiler.duration();

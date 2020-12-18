@@ -35,7 +35,7 @@ namespace rsx
 
 	static inline void memory_protect(const address_range& range, utils::protection prot)
 	{
-		verify(HERE), range.is_page_range();
+		ensure(range.is_page_range());
 
 		//rsx_log.error("memory_protect(0x%x, 0x%x, %x)", static_cast<u32>(range.start), static_cast<u32>(range.length()), static_cast<u32>(prot));
 		utils::memory_protect(vm::base(range.start), range.length(), prot);
@@ -84,7 +84,7 @@ namespace rsx
 
 			AUDIT( (locked_range.start == page_start(range.start)) || (locked_range.start == next_page(range.start)) );
 			AUDIT( locked_range.end <= page_end(range.end) );
-			verify(HERE), locked_range.is_page_range();
+			ensure(locked_range.is_page_range());
 		}
 
 	public:
@@ -94,7 +94,7 @@ namespace rsx
 
 		void reset(const address_range &memory_range)
 		{
-			verify(HERE), memory_range.valid() && locked == false;
+			ensure(memory_range.valid() && locked == false);
 
 			cpu_range = address_range(memory_range);
 			confirmed_range.invalidate();
@@ -109,7 +109,7 @@ namespace rsx
 	protected:
 		void invalidate_range()
 		{
-			ASSERT(!locked);
+			ensure(!locked);
 
 			cpu_range.invalidate();
 			confirmed_range.invalidate();
@@ -121,7 +121,7 @@ namespace rsx
 		{
 			if (new_prot == protection && !force) return;
 
-			verify(HERE), locked_range.is_page_range();
+			ensure(locked_range.is_page_range());
 			AUDIT( !confirmed_range.valid() || confirmed_range.inside(cpu_range) );
 
 #ifdef TEXTURE_CACHE_DEBUG
@@ -174,10 +174,10 @@ namespace rsx
 				else
 				{
 					confirmed_range = address_range::start_length(cpu_range.start + new_confirm.first, new_confirm.second);
-					ASSERT(!locked || locked_range.inside(confirmed_range.to_page_range()));
+					ensure(!locked || locked_range.inside(confirmed_range.to_page_range()));
 				}
 
-				verify(HERE), confirmed_range.inside(cpu_range);
+				ensure(confirmed_range.inside(cpu_range));
 				init_lockable_range(confirmed_range);
 			}
 
@@ -213,7 +213,7 @@ namespace rsx
 			case section_bounds::confirmed_range:
 				return confirmed_range.valid() ? confirmed_range : cpu_range;
 			default:
-				ASSUME(0);
+				fmt::throw_exception("Unreachable");
 			}
 		}
 
@@ -496,7 +496,7 @@ namespace rsx
 
 			if (nb_workers == 1)
 			{
-				std::chrono::time_point<steady_clock> last_update;
+				steady_clock::time_point last_update;
 
 				// Call the worker function directly, stoping it prematurely to be able update the screen
 				u8 inc = 10;
@@ -508,7 +508,7 @@ namespace rsx
 					worker(stop_at);
 
 					// Only update the screen at about 10fps since updating it everytime slows down the process
-					std::chrono::time_point<steady_clock> now = std::chrono::steady_clock::now();
+					steady_clock::time_point now = steady_clock::now();
 					processed_since_last_update += inc;
 					if ((std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update) > 100ms) || (stop_at == entry_count))
 					{
@@ -544,7 +544,10 @@ namespace rsx
 				}
 			}
 
-			verify(HERE), processed == entry_count;
+			if (!Emu.IsStopped())
+			{
+				ensure(processed == entry_count);
+			}
 		}
 
 	public:
@@ -794,8 +797,8 @@ namespace rsx
 		{
 		public:
 			virtual ~default_vertex_cache() = default;
-			virtual storage_type* find_vertex_range(uintptr_t /*local_addr*/, upload_format, u32 /*data_length*/) { return nullptr; }
-			virtual void store_range(uintptr_t /*local_addr*/, upload_format, u32 /*data_length*/, u32 /*offset_in_heap*/) {}
+			virtual storage_type* find_vertex_range(uptr /*local_addr*/, upload_format, u32 /*data_length*/) { return nullptr; }
+			virtual void store_range(uptr /*local_addr*/, upload_format, u32 /*data_length*/, u32 /*offset_in_heap*/) {}
 			virtual void purge() {}
 		};
 
@@ -805,7 +808,7 @@ namespace rsx
 		template <typename upload_format>
 		struct uploaded_range
 		{
-			uintptr_t local_address;
+			uptr local_address;
 			upload_format buffer_format;
 			u32 offset_in_heap;
 			u32 data_length;
@@ -817,11 +820,11 @@ namespace rsx
 			using storage_type = uploaded_range<upload_format>;
 
 		private:
-			std::unordered_map<uintptr_t, std::vector<storage_type>> vertex_ranges;
+			std::unordered_map<uptr, std::vector<storage_type>> vertex_ranges;
 
 		public:
 
-			storage_type* find_vertex_range(uintptr_t local_addr, upload_format fmt, u32 data_length) override
+			storage_type* find_vertex_range(uptr local_addr, upload_format fmt, u32 data_length) override
 			{
 				const auto data_end = local_addr + data_length;
 
@@ -835,7 +838,7 @@ namespace rsx
 				return nullptr;
 			}
 
-			void store_range(uintptr_t local_addr, upload_format fmt, u32 data_length, u32 offset_in_heap) override
+			void store_range(uptr local_addr, upload_format fmt, u32 data_length, u32 offset_in_heap) override
 			{
 				storage_type v = {};
 				v.buffer_format = fmt;
