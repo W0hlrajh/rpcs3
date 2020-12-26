@@ -1,13 +1,5 @@
 #pragma once // No BOM and only basic ASCII in this header, or a neko will die
 
-#ifdef _MSC_VER
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
-#include <immintrin.h>
-#include <emmintrin.h>
-
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -56,9 +48,7 @@ using namespace std::literals;
 #define AUDIT(...) (static_cast<void>(0))
 #endif
 
-#if __cpp_lib_bit_cast >= 201806L
-#include <bit>
-#else
+#if __cpp_lib_bit_cast < 201806L
 namespace std
 {
 	template <class To, class From, typename = std::enable_if_t<sizeof(To) == sizeof(From)>>
@@ -72,7 +62,7 @@ namespace std
 		}
 
 		To result{};
-		std::memcpy(&result, &from, sizeof(From));
+		__builtin_memcpy(&result, &from, sizeof(From));
 		return result;
 	}
 }
@@ -96,6 +86,7 @@ using u8  = std::uint8_t;
 using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
+using usz = std::size_t;
 
 using s8  = std::int8_t;
 using s16 = std::int16_t;
@@ -150,7 +141,7 @@ namespace std
 #endif
 
 // Get integral type from type size
-template <std::size_t N>
+template <usz N>
 struct get_int_impl
 {
 };
@@ -159,35 +150,28 @@ template <>
 struct get_int_impl<sizeof(u8)>
 {
 	using utype = u8;
-	using stype = s8;
 };
 
 template <>
 struct get_int_impl<sizeof(u16)>
 {
 	using utype = u16;
-	using stype = s16;
 };
 
 template <>
 struct get_int_impl<sizeof(u32)>
 {
 	using utype = u32;
-	using stype = s32;
 };
 
 template <>
 struct get_int_impl<sizeof(u64)>
 {
 	using utype = u64;
-	using stype = s64;
 };
 
-template <std::size_t N>
+template <usz N>
 using get_uint_t = typename get_int_impl<N>::utype;
-
-template <std::size_t N>
-using get_sint_t = typename get_int_impl<N>::stype;
 
 template <typename T>
 std::remove_cvref_t<T> as_rvalue(T&& obj)
@@ -195,44 +179,29 @@ std::remove_cvref_t<T> as_rvalue(T&& obj)
 	return std::forward<T>(obj);
 }
 
-// Formatting helper, type-specific preprocessing for improving safety and functionality
-template <typename T, typename = void>
-struct fmt_unveil;
-
-template <typename Arg>
-using fmt_unveil_t = typename fmt_unveil<Arg>::type;
-
-struct fmt_type_info;
-
-namespace fmt
-{
-	template <typename... Args>
-	const fmt_type_info* get_type_info();
-}
-
-template <typename T, std::size_t Align>
+template <typename T, usz Align>
 class atomic_t;
 
 namespace stx
 {
-	template <typename T, bool Se, std::size_t Align>
+	template <typename T, bool Se, usz Align>
 	class se_t;
 }
 
 using stx::se_t;
 
 // se_t<> with native endianness
-template <typename T, std::size_t Align = alignof(T)>
+template <typename T, usz Align = alignof(T)>
 using nse_t = se_t<T, false, Align>;
 
-template <typename T, std::size_t Align = alignof(T)>
+template <typename T, usz Align = alignof(T)>
 using be_t = se_t<T, std::endian::little == std::endian::native, Align>;
-template <typename T, std::size_t Align = alignof(T)>
+template <typename T, usz Align = alignof(T)>
 using le_t = se_t<T, std::endian::big == std::endian::native, Align>;
 
-template <typename T, std::size_t Align = alignof(T)>
+template <typename T, usz Align = alignof(T)>
 using atomic_be_t = atomic_t<be_t<T>, Align>;
-template <typename T, std::size_t Align = alignof(T)>
+template <typename T, usz Align = alignof(T)>
 using atomic_le_t = atomic_t<le_t<T>, Align>;
 
 // Extract T::simple_type if available, remove cv qualifiers
@@ -277,9 +246,27 @@ public:
 };
 
 #ifndef _MSC_VER
+
 using u128 = __uint128_t;
 using s128 = __int128_t;
+
+using __m128i = long long __attribute__((vector_size(16)));
+using __m128d = double __attribute__((vector_size(16)));
+using __m128 = float __attribute__((vector_size(16)));
+
 #else
+
+extern "C"
+{
+	union __m128;
+	union __m128i;
+	struct __m128d;
+
+	uchar _addcarry_u64(uchar, u64, u64, u64*);
+	uchar _subborrow_u64(uchar, u64, u64, u64*);
+	u64 __shiftleft128(u64, u64, uchar);
+	u64 __shiftright128(u64, u64, uchar);
+}
 
 // Unsigned 128-bit integer implementation (TODO)
 struct alignas(16) u128
@@ -534,12 +521,6 @@ constexpr inline struct umax_helper
 	constexpr umax_helper() noexcept = default;
 
 	template <typename T, typename S = simple_t<T>, typename = std::enable_if_t<std::is_unsigned_v<S>>>
-	explicit constexpr operator T() const
-	{
-		return static_cast<S>(-1);
-	}
-
-	template <typename T, typename S = simple_t<T>, typename = std::enable_if_t<std::is_unsigned_v<S>>>
 	constexpr bool operator==(const T& rhs) const
 	{
 		return rhs == static_cast<S>(-1);
@@ -570,57 +551,10 @@ constexpr inline struct umax_helper
 #endif
 } umax;
 
+enum class f16 : u16{};
+
 using f32 = float;
 using f64 = double;
-
-union alignas(2) f16
-{
-	u16 _u16;
-	u8 _u8[2];
-
-	explicit f16(u16 raw)
-	{
-		_u16 = raw;
-	}
-
-	explicit operator f32() const
-	{
-		// See http://stackoverflow.com/a/26779139
-		// The conversion doesn't handle NaN/Inf
-		u32 raw = ((_u16 & 0x8000) << 16) |             // Sign (just moved)
-				  (((_u16 & 0x7c00) + 0x1C000) << 13) | // Exponent ( exp - 15 + 127)
-				  ((_u16 & 0x03FF) << 13);              // Mantissa
-
-		return std::bit_cast<f32>(raw);
-	}
-};
-
-CHECK_SIZE_ALIGN(f16, 2, 2);
-
-template <typename T, typename = std::enable_if_t<std::is_integral<T>::value && std::is_unsigned<T>::value>>
-constexpr T align(T value, ullong align)
-{
-	return static_cast<T>((value + (align - 1)) & (0 - align));
-}
-
-// General purpose aligned division, the result is rounded up not truncated
-template <typename T, typename = std::enable_if_t<std::is_integral<T>::value && std::is_unsigned<T>::value>>
-constexpr T aligned_div(T value, ullong align)
-{
-	return static_cast<T>((value + align - 1) / align);
-}
-
-// General purpose aligned division, the result is rounded to nearest
-template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
-constexpr T rounded_div(T value, std::conditional_t<std::is_signed<T>::value, llong, ullong> align)
-{
-	if constexpr (std::is_unsigned<T>::value)
-	{
-		return static_cast<T>((value + (align / 2)) / align);
-	}
-
-	return static_cast<T>((value + (value < 0 ? 0 - align : align) / 2) / align);
-}
 
 template <typename T, typename T2>
 inline u32 offset32(T T2::*const mptr)
@@ -628,7 +562,7 @@ inline u32 offset32(T T2::*const mptr)
 #ifdef _MSC_VER
 	return std::bit_cast<u32>(mptr);
 #elif __GNUG__
-	return std::bit_cast<std::size_t>(mptr);
+	return std::bit_cast<usz>(mptr);
 #else
 	static_assert(sizeof(mptr) == 0, "Unsupported pointer-to-member size");
 #endif
@@ -646,7 +580,7 @@ struct offset32_array
 	}
 };
 
-template <typename T, std::size_t N>
+template <typename T, usz N>
 struct offset32_array<std::array<T, N>>
 {
 	template <typename Arg>
@@ -692,7 +626,7 @@ constexpr u32 to_u8(char c)
 }
 
 // Convert 1-2-byte string to u16 value like reinterpret_cast does
-constexpr u16 operator""_u16(const char* s, std::size_t /*length*/)
+constexpr u16 operator""_u16(const char* s, usz /*length*/)
 {
 	if constexpr (std::endian::little == std::endian::native)
 	{
@@ -705,7 +639,7 @@ constexpr u16 operator""_u16(const char* s, std::size_t /*length*/)
 }
 
 // Convert 3-4-byte string to u32 value like reinterpret_cast does
-constexpr u32 operator""_u32(const char* s, std::size_t /*length*/)
+constexpr u32 operator""_u32(const char* s, usz /*length*/)
 {
 	if constexpr (std::endian::little == std::endian::native)
 	{
@@ -718,7 +652,7 @@ constexpr u32 operator""_u32(const char* s, std::size_t /*length*/)
 }
 
 // Convert 5-6-byte string to u64 value like reinterpret_cast does
-constexpr u64 operator""_u48(const char* s, std::size_t /*length*/)
+constexpr u64 operator""_u48(const char* s, usz /*length*/)
 {
 	if constexpr (std::endian::little == std::endian::native)
 	{
@@ -731,7 +665,7 @@ constexpr u64 operator""_u48(const char* s, std::size_t /*length*/)
 }
 
 // Convert 7-8-byte string to u64 value like reinterpret_cast does
-constexpr u64 operator""_u64(const char* s, std::size_t /*length*/)
+constexpr u64 operator""_u64(const char* s, usz /*length*/)
 {
 	if constexpr (std::endian::little == std::endian::native)
 	{
@@ -761,7 +695,7 @@ struct src_loc
 namespace fmt
 {
 	[[noreturn]] void raw_verify_error(const src_loc& loc);
-	[[noreturn]] void raw_narrow_error(const src_loc& loc, const fmt_type_info* sup, u64 arg);
+	[[noreturn]] void raw_narrow_error(const src_loc& loc);
 }
 
 template <typename T>
@@ -862,7 +796,7 @@ template <typename To = void, typename From, typename = decltype(static_cast<To>
 	if (narrow_impl<From, To>::test(value)) [[unlikely]]
 	{
 		// Pack value as formatting argument
-		fmt::raw_narrow_error({line, col, file, func}, fmt::get_type_info<fmt_unveil_t<From>>(), fmt_unveil<From>::get(value));
+		fmt::raw_narrow_error({line, col, file, func});
 	}
 
 	return static_cast<To>(value);
@@ -880,35 +814,19 @@ template <typename CT, typename = decltype(static_cast<u32>(std::declval<CT>().s
 }
 
 // Returns u32 size for an array
-template <typename T, std::size_t Size>
+template <typename T, usz Size>
 [[nodiscard]] constexpr u32 size32(const T (&)[Size])
 {
 	static_assert(Size < UINT32_MAX, "Array is too big for 32-bit");
 	return static_cast<u32>(Size);
 }
 
-// Simplified hash algorithm for pointers. May be used in std::unordered_(map|set).
-template <typename T, std::size_t Align = alignof(T)>
-struct pointer_hash
-{
-	std::size_t operator()(T* ptr) const
-	{
-		return reinterpret_cast<uptr>(ptr) / Align;
-	}
-};
-
-template <typename T, std::size_t Shift = 0>
+// Simplified hash algorithm. May be used in std::unordered_(map|set).
+template <typename T, usz Shift = 0>
 struct value_hash
 {
-	std::size_t operator()(T value) const
+	usz operator()(T value) const
 	{
-		return static_cast<std::size_t>(value) >> Shift;
+		return static_cast<usz>(value) >> Shift;
 	}
 };
-
-// Synchronization helper (cache-friendly busy waiting)
-inline void busy_wait(std::size_t cycles = 3000)
-{
-	const u64 s = __rdtsc();
-	do _mm_pause(); while (__rdtsc() - s < cycles);
-}

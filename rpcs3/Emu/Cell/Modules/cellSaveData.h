@@ -1,9 +1,10 @@
 #pragma once
 
-#include "stdafx.h"
-#include <Emu/Memory/vm_ptr.h>
-
-#include "util/v128.hpp"
+#include "util/types.hpp"
+#include "util/endian.hpp"
+#include "Emu/Memory/vm_ptr.h"
+#include <string>
+#include <vector>
 
 // Return codes
 enum CellSaveDataError : u32
@@ -300,7 +301,7 @@ struct CellSaveDataFileSet
 	be_t<u32> fileOperation;
 	vm::bptr<void> reserved;
 	be_t<u32> fileType;
-	be_t<v128, 1> secureFileId;
+	be_t<u128, 1> secureFileId;
 	vm::bptr<char> fileName;
 	be_t<u32> fileOffset;
 	be_t<u32> fileSize;

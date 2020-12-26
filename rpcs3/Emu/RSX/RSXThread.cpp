@@ -4,6 +4,7 @@
 #include "Emu/Cell/PPUCallback.h"
 
 #include "Common/BufferUtils.h"
+#include "Common/GLSLCommon.h"
 #include "Common/texture_cache.h"
 #include "Common/surface_store.h"
 #include "Capture/rsx_capture.h"
@@ -137,6 +138,52 @@ namespace rsx
 		}
 
 		fmt::throw_exception("rsx::get_address(offset=0x%x, location=0x%x): %s%s", offset, location, msg, src_loc{line, col, file, func});
+	}
+
+	std::pair<u32, u32> interleaved_range_info::calculate_required_range(u32 first, u32 count) const
+	{
+		if (single_vertex)
+		{
+			return { 0, 1 };
+		}
+
+		const u32 max_index = (first + count) - 1;
+		u32 _max_index = 0;
+		u32 _min_index = first;
+
+		for (const auto &attrib : locations)
+		{
+			if (attrib.frequency <= 1) [[likely]]
+			{
+				_max_index = max_index;
+			}
+			else
+			{
+				if (attrib.modulo)
+				{
+					if (max_index >= attrib.frequency)
+					{
+						// Actually uses the modulo operator
+						_min_index = 0;
+						_max_index = attrib.frequency - 1;
+					}
+					else
+					{
+						// Same as having no modulo
+						_max_index = max_index;
+					}
+				}
+				else
+				{
+					// Division operator
+					_min_index = std::min(_min_index, first / attrib.frequency);
+					_max_index = std::max<u32>(_max_index, utils::aligned_div(max_index, attrib.frequency));
+				}
+			}
+		}
+
+		ensure(_max_index >= _min_index);
+		return { _min_index, (_max_index - _min_index) + 1 };
 	}
 
 	u32 get_vertex_type_size_on_host(vertex_base_type type, u32 size)
@@ -816,7 +863,7 @@ namespace rsx
 
 			for (; t == now; now = get_time_ns())
 			{
-				_mm_pause();
+				utils::pause();
 			}
 
 			timestamp_ctrl = now;
@@ -1807,7 +1854,7 @@ namespace rsx
 				if (tex.alpha_kill_enabled())
 				{
 					//alphakill can be ignored unless a valid comparison function is set
-					texture_control |= (1 << 4);
+					texture_control |= (1 << texture_control_bits::ALPHAKILL);
 				}
 
 				const u32 texaddr = rsx::get_address(tex.offset(), tex.location());
@@ -1819,37 +1866,34 @@ namespace rsx
 
 				if (sampler_descriptors[i]->format_class != RSX_FORMAT_CLASS_COLOR)
 				{
-					switch (format)
+					switch (sampler_descriptors[i]->format_class)
 					{
-					case CELL_GCM_TEXTURE_X16:
-					{
-						// A simple way to quickly read DEPTH16 data without shadow comparison
+					case RSX_FORMAT_CLASS_DEPTH16_FLOAT:
+					case RSX_FORMAT_CLASS_DEPTH24_FLOAT_X8_PACK32:
+						texture_control |= (1 << texture_control_bits::DEPTH_FLOAT);
+						break;
+					default:
 						break;
 					}
+
+					switch (format)
+					{
 					case CELL_GCM_TEXTURE_A8R8G8B8:
 					case CELL_GCM_TEXTURE_D8R8G8B8:
 					{
-						// Reading depth data as XRGB8 is supported with in-shader conversion
-						// TODO: Optionally add support for 16-bit formats (not necessary since type casts are easy with that)
-						u32 control_bits = sampler_descriptors[i]->format_class == RSX_FORMAT_CLASS_DEPTH24_FLOAT_X8_PACK32? (1u << 16) : 0u;
-						control_bits |= tex.remap() & 0xFFFF;
+						// Emulate bitcast in shader
 						current_fragment_program.redirected_textures |= (1 << i);
-						current_fragment_program.texture_scale[i][2] = std::bit_cast<f32>(control_bits);
+						const auto float_en = (sampler_descriptors[i]->format_class == RSX_FORMAT_CLASS_DEPTH24_FLOAT_X8_PACK32)? 1 : 0;
+						texture_control |= (float_en << texture_control_bits::DEPTH_FLOAT);
 						break;
 					}
+					case CELL_GCM_TEXTURE_X16: // A simple way to quickly read DEPTH16 data without shadow comparison
 					case CELL_GCM_TEXTURE_DEPTH16:
-					case CELL_GCM_TEXTURE_DEPTH16_FLOAT:
 					case CELL_GCM_TEXTURE_DEPTH24_D8:
+					case CELL_GCM_TEXTURE_DEPTH16_FLOAT:
 					case CELL_GCM_TEXTURE_DEPTH24_D8_FLOAT:
 					{
-						const auto compare_mode = tex.zfunc();
-						if (!tex.alpha_kill_enabled() &&
-							compare_mode < rsx::comparison_function::always &&
-							compare_mode > rsx::comparison_function::never)
-						{
-							current_fragment_program.shadow_textures |= (1 << i);
-							texture_control |= u32(tex.zfunc()) << 8;
-						}
+						// Supported formats, nothing to do
 						break;
 					}
 					default:
@@ -1866,7 +1910,7 @@ namespace rsx
 					case CELL_GCM_TEXTURE_R5G5B5A1:
 					case CELL_GCM_TEXTURE_R5G6B5:
 					case CELL_GCM_TEXTURE_R6G5B5:
-						texture_control |= (1 << 5);
+						texture_control |= (1 << texture_control_bits::RENORMALIZE);
 						break;
 					default:
 						break;
@@ -1886,14 +1930,14 @@ namespace rsx
 					const auto remap_ctrl = (tex.remap() >> 8) & 0xAA;
 					if (remap_ctrl == 0xAA)
 					{
-						argb8_convert |= (sign_convert & 0xFu) << 6;
+						argb8_convert |= (sign_convert & 0xFu) << texture_control_bits::EXPAND_OFFSET;
 					}
 					else
 					{
-						if (remap_ctrl & 0x03) argb8_convert |= (sign_convert & 0x1u) << 6;
-						if (remap_ctrl & 0x0C) argb8_convert |= (sign_convert & 0x2u) << 6;
-						if (remap_ctrl & 0x30) argb8_convert |= (sign_convert & 0x4u) << 6;
-						if (remap_ctrl & 0xC0) argb8_convert |= (sign_convert & 0x8u) << 6;
+						if (remap_ctrl & 0x03) argb8_convert |= (sign_convert & 0x1u) << texture_control_bits::EXPAND_OFFSET;
+						if (remap_ctrl & 0x0C) argb8_convert |= (sign_convert & 0x2u) << texture_control_bits::EXPAND_OFFSET;
+						if (remap_ctrl & 0x30) argb8_convert |= (sign_convert & 0x4u) << texture_control_bits::EXPAND_OFFSET;
+						if (remap_ctrl & 0xC0) argb8_convert |= (sign_convert & 0x8u) << texture_control_bits::EXPAND_OFFSET;
 					}
 				}
 
@@ -2521,7 +2565,7 @@ namespace rsx
 		}
 
 		// Some cases do not need full delay
-		remaining = ::aligned_div(remaining, div);
+		remaining = utils::aligned_div(remaining, div);
 		const u64 until = get_system_time() + remaining;
 
 		while (true)
@@ -2616,7 +2660,7 @@ namespace rsx
 
 				for (u32 ea = address >> 20, end = ea + (size >> 20); ea < end; ea++)
 				{
-					const u32 io = utils::ror32(iomap_table.io[ea], 20);
+					const u32 io = utils::rol32(iomap_table.io[ea], 32 - 20);
 
 					if (io + 1)
 					{
@@ -2701,7 +2745,7 @@ namespace rsx
 			if (Emu.IsStopped())
 				break;
 
-			_mm_pause();
+			utils::pause();
 		}
 	}
 
@@ -2725,7 +2769,7 @@ namespace rsx
 			while (external_interrupt_lock)
 			{
 				// TODO: Investigate non busy-spinning method
-				_mm_pause();
+				utils::pause();
 			}
 
 			external_interrupt_ack.store(false);

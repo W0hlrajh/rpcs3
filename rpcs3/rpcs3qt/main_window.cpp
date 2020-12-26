@@ -1,5 +1,3 @@
-#include "stdafx.h"
-
 #include "main_window.h"
 #include "qt_utils.h"
 #include "vfs_dialog.h"
@@ -781,7 +779,7 @@ void main_window::HandlePupInstallation(QString file_path)
 
 	std::string version_string = pup.get_file(0x100).to_string();
 
-	if (const size_t version_pos = version_string.find('\n'); version_pos != umax)
+	if (const usz version_pos = version_string.find('\n'); version_pos != umax)
 	{
 		version_string.erase(version_pos);
 	}
@@ -886,12 +884,12 @@ void main_window::DecryptSPRXLibraries()
 	gui_log.notice("Decrypting binaries...");
 
 	// Always start with no KLIC
-	std::vector<v128> klics{v128{}};
+	std::vector<u128> klics{u128{}};
 
 	if (const auto keys = g_fxo->get<loaded_npdrm_keys>())
 	{
 		// Second klic: get it from a running game
-		if (const v128 klic = keys->devKlic; klic != v128{})
+		if (const u128 klic = keys->devKlic)
 		{
 			klics.emplace_back(klic);
 		}
@@ -905,7 +903,7 @@ void main_window::DecryptSPRXLibraries()
 
 		bool tried = false;
 		bool invalid = false;
-		std::size_t key_it = 0;
+		usz key_it = 0;
 
 		while (true)
 		{
@@ -914,7 +912,7 @@ void main_window::DecryptSPRXLibraries()
 				if (elf_file.open(old_path) && elf_file.size() >= 4 && elf_file.read<u32>() == "SCE\0"_u32)
 				{
 					// First KLIC is no KLIC
-					elf_file = decrypt_self(std::move(elf_file), key_it != 0 ? klics[key_it]._bytes : nullptr);
+					elf_file = decrypt_self(std::move(elf_file), key_it != 0 ? reinterpret_cast<u8*>(&klics[key_it]) : nullptr);
 
 					if (!elf_file)
 					{
@@ -953,7 +951,7 @@ void main_window::DecryptSPRXLibraries()
 				// Allow the user to manually type KLIC if decryption failed
 
 				const std::string filename = old_path.substr(old_path.find_last_of(fs::delim) + 1);
-	
+
 				const QString hint = tr("Hint: KLIC (KLicense key) is a 16-byte long string. (32 hexadecimal characters)"
 							"\nAnd is logged with some sceNpDrm* functions when the game/application which owns \"%0\" is running.").arg(qstr(filename));
 
@@ -986,11 +984,15 @@ void main_window::DecryptSPRXLibraries()
 					ensure(text.size() == 32);
 
 					// It must succeed (only hex characters are present)
-					std::from_chars(&text[0], &text[16], klic._u64[1], 16); // Not a typo: on LE systems the u64[1] part will be swapped with u64[0] later
-					std::from_chars(&text[16], &text[32], klic._u64[0], 16); // And on BE systems it will be already swapped by index internally
+					u64 lo_ = 0;
+					u64 hi_ = 0;
+					std::from_chars(&text[0], &text[16], lo_, 16);
+					std::from_chars(&text[16], &text[32], hi_, 16);
 
-					// Needs to be in big endian because the left to right byte-order means big endian
-					klic = std::bit_cast<be_t<v128>>(klic);
+					be_t<u64> lo = std::bit_cast<be_t<u64>>(lo_);
+					be_t<u64> hi = std::bit_cast<be_t<u64>>(hi_);
+
+					klic = (u128{+hi} << 64) | +lo;
 
 					// Retry with specified KLIC
 					key_it -= +std::exchange(tried, true); // Rewind on second and above attempt

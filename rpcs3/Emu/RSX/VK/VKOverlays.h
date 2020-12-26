@@ -11,6 +11,7 @@
 #include "../Overlays/overlays.h"
 
 #include "Utilities/hash.h"
+#include <unordered_map>
 
 #define VK_OVERLAY_MAX_DRAW_CALLS 1024
 
@@ -1011,7 +1012,7 @@ namespace vk
 			vkCmdSetScissor(cmd, 0, 1, &region);
 		}
 
-		void run(vk::command_buffer& cmd, vk::render_target* target, VkRect2D rect, uint32_t stencil_clear, uint32_t stencil_write_mask, VkRenderPass render_pass)
+		void run(vk::command_buffer& cmd, vk::render_target* target, VkRect2D rect, u32 stencil_clear, u32 stencil_write_mask, VkRenderPass render_pass)
 		{
 			region = rect;
 

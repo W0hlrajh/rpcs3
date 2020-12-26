@@ -4,6 +4,7 @@
 #include "../Memory/vm_ptr.h"
 #include "Utilities/lockless.h"
 
+#include "util/logs.hpp"
 #include "util/v128.hpp"
 
 LOG_CHANNEL(ppu_log, "PPU");
@@ -137,7 +138,7 @@ public:
 		u8 bits[32];
 		u32 fields[8];
 
-		u8& operator [](std::size_t i)
+		u8& operator [](usz i)
 		{
 			return bits[i];
 		}

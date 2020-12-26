@@ -1,7 +1,6 @@
 #include "stdafx.h"
 #include "Utilities/JIT.h"
 #include "Utilities/date_time.h"
-#include "Utilities/sysinfo.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/Memory/vm_ptr.h"
 #include "Emu/Memory/vm_reservation.h"
@@ -32,6 +31,8 @@
 #include "util/vm.hpp"
 #include "util/asm.hpp"
 #include "util/v128.hpp"
+#include "util/v128sse.hpp"
+#include "util/sysinfo.hpp"
 
 using spu_rdata_t = decltype(spu_thread::rdata);
 
@@ -1288,9 +1289,7 @@ std::string spu_thread::dump_regs() const
 
 		if (i3 >= 0x80 && is_exec_code(i3))
 		{
-			SPUDisAsm dis_asm(CPUDisAsm_NormalMode);
-			dis_asm.offset = ls;
-			dis_asm.dump_pc = i3;
+			SPUDisAsm dis_asm(CPUDisAsm_NormalMode, ls);
 			dis_asm.disasm(i3);
 			fmt::append(ret, " -> %s", dis_asm.last_opcode);
 		}
@@ -1318,12 +1317,6 @@ std::string spu_thread::dump_regs() const
 	fmt::append(ret, "Stall Mask: 0x%x\n", ch_stall_mask);
 	fmt::append(ret, "Tag Stat: %s\n", ch_tag_stat);
 	fmt::append(ret, "Tag Update: %s\n", mfc_tag_update{ch_tag_upd});
-
-	if (const u32 addr = raddr)
-		fmt::append(ret, "Reservation Addr: 0x%x\n", addr);
-	else
-		fmt::append(ret, "Reservation Addr: none\n");
-
 	fmt::append(ret, "Atomic Stat: %s\n", ch_atomic_stat); // TODO: use mfc_atomic_status formatting
 	fmt::append(ret, "Interrupts: %s\n", interrupts_enabled ? "Enabled" : "Disabled");
 	fmt::append(ret, "Inbound Mailbox: %s\n", ch_in_mbox);
@@ -1331,7 +1324,21 @@ std::string spu_thread::dump_regs() const
 	fmt::append(ret, "Out Interrupts Mailbox: %s\n", ch_out_intr_mbox);
 	fmt::append(ret, "SNR config: 0x%llx\n", snr_config);
 	fmt::append(ret, "SNR1: %s\n", ch_snr1);
-	fmt::append(ret, "SNR2: %s", ch_snr2);
+	fmt::append(ret, "SNR2: %s\n", ch_snr2);
+
+	const u32 addr = raddr;
+
+	fmt::append(ret, "Reservation Addr: %s\n", addr ? fmt::format("0x%x", addr) : "N/A");
+	fmt::append(ret, "Reservation Data:\n");
+
+	be_t<u32> data[32]{};
+	std::memcpy(data, rdata, sizeof(rdata)); // Show the data even if the reservation was lost inside the atomic loop 
+
+	for (usz i = 0; i < std::size(data); i += 4)
+	{
+		fmt::append(ret, "[0x%02x] %08x %08x %08x %08x\n", i * sizeof(data[0])
+			, data[i + 0], data[i + 1], data[i + 2], data[i + 3]);
+	}
 
 	return ret;
 }
@@ -1560,7 +1567,7 @@ void spu_thread::cpu_return()
 						for (u32 status; !thread->exit_status.try_read(status)
 							|| status != thread->last_exit_status;)
 						{
-							_mm_pause();
+							utils::pause();
 						}
 					}
 				}
@@ -2338,7 +2345,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 			}
 
 			u32 range_addr = eal & -128;
-			u32 range_end = ::align(eal + size, 128);
+			u32 range_end = utils::align(eal + size, 128);
 
 			// Handle the case of crossing 64K page borders (TODO: maybe split in 4K fragments?)
 			if (range_addr >> 16 != (range_end - 1) >> 16)
@@ -3751,6 +3758,12 @@ s64 spu_thread::get_ch_value(u32 ch)
 
 			for (; !events.count; events = get_events(mask1, false, true))
 			{
+				if (is_paused())
+				{
+					// Ensure reservation data won't change while paused for debugging purposes
+					check_state();
+				}
+
 				state += cpu_flag::wait;
 
 				if (is_stopped())
@@ -3767,6 +3780,11 @@ s64 spu_thread::get_ch_value(u32 ch)
 
 		for (; !events.count; events = get_events(mask1, true, true))
 		{
+			if (is_paused())
+			{
+				check_state();
+			}
+
 			state += cpu_flag::wait;
 
 			if (is_stopped())
@@ -4594,7 +4612,7 @@ bool spu_thread::capture_local_storage() const
 		if (name.empty())
 		{
 			// TODO: Maybe add thread group name here
-			fmt::append(name, "SPU.%u", lv2_id);
+			fmt::append(name, "SPU.0x%07x", lv2_id);
 		}
 	}
 	else

@@ -6,6 +6,8 @@
 #include "Utilities/StrUtil.h"
 #include "util/types.hpp"
 
+#include <unordered_map>
+
 enum class FUNCTION
 {
 	FUNCTION_DP2,
@@ -218,7 +220,7 @@ public:
 		}
 	}
 
-	size_t get_vector_size() const
+	usz get_vector_size() const
 	{
 		return swizzles[swizzles.size() - 1].length();
 	}

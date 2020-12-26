@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "util/types.hpp"
 #include "util/atomic.hpp"
@@ -262,7 +262,7 @@ public:
 	static u64 get_thread_affinity_mask();
 
 	// Get current thread stack addr and size
-	static std::pair<void*, std::size_t> get_thread_stack();
+	static std::pair<void*, usz> get_thread_stack();
 
 private:
 	// Miscellaneous

@@ -2,7 +2,6 @@
 
 #ifdef LLVM_AVAILABLE
 
-#include "restore_new.h"
 #ifdef _MSC_VER
 #pragma warning(push, 0)
 #else
@@ -22,7 +21,6 @@
 #else
 #pragma GCC diagnostic pop
 #endif
-#include "define_new_memleakdetect.h"
 
 #include "util/types.hpp"
 #include "Utilities/StrFmt.h"
@@ -2917,9 +2915,9 @@ public:
 template <>
 struct fmt_unveil<llvm::TypeSize, void>
 {
-	using type = std::size_t;
+	using type = usz;
 
-	static inline std::size_t get(const llvm::TypeSize& arg)
+	static inline usz get(const llvm::TypeSize& arg)
 	{
 		return arg;
 	}

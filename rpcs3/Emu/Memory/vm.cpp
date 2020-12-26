@@ -323,7 +323,7 @@ namespace vm
 				break;
 			}
 
-			_mm_pause();
+			utils::pause();
 		}
 	}
 
@@ -525,7 +525,7 @@ namespace vm
 					break;
 				}
 
-				_mm_pause();
+				utils::pause();
 			}
 
 			for (auto lock = g_locks.cbegin(), end = lock + g_cfg.core.ppu_threads; lock != end; lock++)
@@ -533,7 +533,9 @@ namespace vm
 				if (auto ptr = +*lock)
 				{
 					while (!(ptr->state & cpu_flag::wait))
-						_mm_pause();
+					{
+						utils::pause();
+					}
 				}
 			}
 		}
@@ -974,13 +976,13 @@ namespace vm
 
 			if (state & page_1m_size)
 			{
-				i = ::align(i + 1, 0x100000 / 4096);
+				i = utils::align(i + 1, 0x100000 / 4096);
 				continue;
 			}
 
 			if (state & page_64k_size)
 			{
-				i = ::align(i + 1, 0x10000 / 4096);
+				i = utils::align(i + 1, 0x10000 / 4096);
 				continue;
 			}
 
@@ -1056,6 +1058,9 @@ namespace vm
 		}
 	}
 
+	// Mapped regions: addr -> shm handle
+	constexpr auto block_map = &auto_typemap<block_t>::get<std::map<u32, std::pair<u32, std::shared_ptr<utils::shm>>>>;
+
 	bool block_t::try_alloc(u32 addr, u8 flags, u32 size, std::shared_ptr<utils::shm>&& shm)
 	{
 		// Check if memory area is already mapped
@@ -1080,7 +1085,9 @@ namespace vm
 		// Map "real" memory pages; provide a function to search for mirrors with private member access
 		_page_map(page_addr, flags, page_size, shm.get(), [](vm::block_t* _this, utils::shm* shm)
 		{
-			decltype(m_map)::value_type* result = nullptr;
+			auto& map = (_this->m.*block_map)();
+
+			std::remove_reference_t<decltype(map)>::value_type* result = nullptr;
 
 			// Check eligibility
 			if (!_this || !(SYS_MEMORY_PAGE_SIZE_MASK & _this->flags) || _this->addr < 0x20000000 || _this->addr >= 0xC0000000)
@@ -1088,7 +1095,7 @@ namespace vm
 				return result;
 			}
 
-			for (auto& pp : _this->m_map)
+			for (auto& pp : map)
 			{
 				if (pp.second.second.get() == shm)
 				{
@@ -1103,7 +1110,7 @@ namespace vm
 		// Fill stack guards with STACKGRD
 		if (this->flags & 0x10)
 		{
-			auto fill64 = [](u8* ptr, u64 data, std::size_t count)
+			auto fill64 = [](u8* ptr, u64 data, usz count)
 			{
 				u64* target = reinterpret_cast<u64*>(ptr);
 
@@ -1123,7 +1130,7 @@ namespace vm
 		}
 
 		// Add entry
-		m_map[addr] = std::make_pair(size, std::move(shm));
+		(m.*block_map)()[addr] = std::make_pair(size, std::move(shm));
 
 		return true;
 	}
@@ -1145,6 +1152,7 @@ namespace vm
 
 	block_t::~block_t()
 	{
+		auto& m_map = (m.*block_map)();
 		{
 			vm::writer_lock lock(0);
 
@@ -1177,7 +1185,7 @@ namespace vm
 		const u32 min_page_size = flags & 0x100 ? 0x1000 : 0x10000;
 
 		// Align to minimal page size
-		const u32 size = ::align(orig_size, min_page_size) + (flags & 0x10 ? 0x2000 : 0);
+		const u32 size = utils::align(orig_size, min_page_size) + (flags & 0x10 ? 0x2000 : 0);
 
 		// Check alignment (it's page allocation, so passing small values there is just silly)
 		if (align < min_page_size || align != (0x80000000u >> std::countl_zero(align)))
@@ -1217,7 +1225,7 @@ namespace vm
 		vm::writer_lock lock(0);
 
 		// Search for an appropriate place (unoptimized)
-		for (u32 addr = ::align(this->addr, align); u64{addr} + size <= u64{this->addr} + this->size; addr += align)
+		for (u32 addr = utils::align(this->addr, align); u64{addr} + size <= u64{this->addr} + this->size; addr += align)
 		{
 			if (try_alloc(addr, pflags, size, std::move(shm)))
 			{
@@ -1240,7 +1248,7 @@ namespace vm
 		const u32 min_page_size = flags & 0x100 ? 0x1000 : 0x10000;
 
 		// Align to minimal page size
-		const u32 size = ::align(orig_size, min_page_size);
+		const u32 size = utils::align(orig_size, min_page_size);
 
 		// return if addr or size is invalid
 		if (!size || addr < this->addr || orig_size > size || addr + u64{size} > this->addr + u64{this->size} || flags & 0x10)
@@ -1283,6 +1291,7 @@ namespace vm
 
 	u32 block_t::dealloc(u32 addr, const std::shared_ptr<utils::shm>* src)
 	{
+		auto& m_map = (m.*block_map)();
 		{
 			vm::writer_lock lock(0);
 
@@ -1332,6 +1341,8 @@ namespace vm
 			return {addr, nullptr};
 		}
 
+		auto& m_map = (m.*block_map)();
+
 		vm::reader_lock lock;
 
 		const auto upper = m_map.upper_bound(addr);
@@ -1368,7 +1379,7 @@ namespace vm
 	{
 		u32 result = 0;
 
-		for (auto& entry : m_map)
+		for (auto& entry : (m.*block_map)())
 		{
 			result += entry.second.first - (flags & 0x10 ? 0x2000 : 0);
 		}
@@ -1410,7 +1421,7 @@ namespace vm
 
 	static std::shared_ptr<block_t> _find_map(u32 size, u32 align, u64 flags)
 	{
-		for (u32 addr = ::align<u32>(mem_user64k_base, align); addr - 1 < mem_rsx_base - 1; addr += align)
+		for (u32 addr = utils::align<u32>(mem_user64k_base, align); addr - 1 < mem_rsx_base - 1; addr += align)
 		{
 			if (_test_map(addr, size))
 			{
@@ -1485,7 +1496,7 @@ namespace vm
 		vm::writer_lock lock(0);
 
 		// Align to minimal page size
-		const u32 size = ::align(orig_size, 0x10000);
+		const u32 size = utils::align(orig_size, 0x10000);
 
 		// Check alignment
 		if (align < 0x10000 || align != (0x80000000u >> std::countl_zero(align)))
@@ -1606,7 +1617,7 @@ namespace vm
 					case 2: atomic_storage<u16>::release(*static_cast<u16*>(dst), *static_cast<u16*>(src)); break;
 					case 4: atomic_storage<u32>::release(*static_cast<u32*>(dst), *static_cast<u32*>(src)); break;
 					case 8: atomic_storage<u64>::release(*static_cast<u64*>(dst), *static_cast<u64*>(src)); break;
-					case 16: _mm_store_si128(static_cast<__m128i*>(dst), _mm_loadu_si128(static_cast<__m128i*>(src))); break;
+					case 16: atomic_storage<u128>::release(*static_cast<u128*>(dst), *static_cast<u128*>(src)); break;
 					}
 
 					return true;

@@ -27,6 +27,8 @@
 #include <QVBoxLayout>
 #include <QTimer>
 
+#include "util/asm.hpp"
+
 constexpr auto qstr = QString::fromStdString;
 
 debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *parent)
@@ -224,12 +226,13 @@ void debugger_frame::keyPressEvent(QKeyEvent* event)
 	const auto cpu = this->cpu.lock();
 	int i = m_debugger_list->currentRow();
 
-	if (!isActiveWindow() || !cpu || m_no_thread_selected)
+	if (!isActiveWindow() || !cpu)
 	{
 		return;
 	}
 
-	const u32 pc = i >= 0 ? m_debugger_list->m_pc + i * 4 : cpu->get_pc();
+	const u32 address_limits = (cpu->id_type() != 1 ? 0x3fffc : ~3);
+	const u32 pc = (i >= 0 ? m_debugger_list->m_pc + i * 4 : cpu->get_pc()) & address_limits;
 
 	const auto modifiers = QApplication::keyboardModifiers();
 
@@ -301,7 +304,7 @@ void debugger_frame::keyPressEvent(QKeyEvent* event)
 			{
 				be_t<ppu_opcode_t> op{};
 
-				if (vm::try_access(pc, &op, 4, false))
+				if (vm::check_addr(pc, vm::page_executable) && vm::try_access(pc, &op, 4, false))
 					res = op_branch_targets(pc, op);
 
 				break;
@@ -353,8 +356,6 @@ void debugger_frame::keyPressEvent(QKeyEvent* event)
 void debugger_frame::UpdateUI()
 {
 	UpdateUnitList();
-
-	if (m_no_thread_selected) return;
 
 	const auto cpu = this->cpu.lock();
 
@@ -419,10 +420,8 @@ void debugger_frame::UpdateUnitList()
 		return;
 	}
 
+	const int old_size = m_choice_units->count();
 	QVariant old_cpu = m_choice_units->currentData();
-
-	m_choice_units->clear();
-	m_choice_units->addItem(NoThreadString);
 
 	const auto on_select = [&](u32 id, cpu_thread& cpu)
 	{
@@ -436,6 +435,9 @@ void debugger_frame::UpdateUnitList()
 	{
 		const QSignalBlocker blocker(m_choice_units);
 
+		m_choice_units->clear();
+		m_choice_units->addItem(NoThreadString);
+
 		idm::select<named_thread<ppu_thread>>(on_select);
 		idm::select<named_thread<spu_thread>>(on_select);
 	}
@@ -447,25 +449,29 @@ void debugger_frame::UpdateUnitList()
 
 void debugger_frame::OnSelectUnit()
 {
-	if (m_choice_units->count() < 1 || m_current_choice == m_choice_units->currentText()) return;
+	if (m_choice_units->count() < 1) return;
 
-	m_current_choice = m_choice_units->currentText();
-	m_no_thread_selected = m_current_choice == NoThreadString;
-	m_debugger_list->m_no_thread_selected = m_no_thread_selected;
+	const auto weak = m_choice_units->currentData().value<std::weak_ptr<cpu_thread>>();
+
+	if (!weak.owner_before(cpu) && !cpu.owner_before(weak))
+	{
+		// They match, nothing to do.
+		return;
+	}
 
 	m_disasm.reset();
 	cpu.reset();
 
-	if (!m_no_thread_selected)
+	if (!weak.expired())
 	{
-		if (const auto cpu0 = m_choice_units->currentData().value<std::weak_ptr<cpu_thread>>().lock())
+		if (const auto cpu0 = weak.lock())
 		{
 			if (cpu0->id_type() == 1)
 			{
 				if (cpu0.get() == idm::check<named_thread<ppu_thread>>(cpu0->id))
 				{
 					cpu = cpu0;
-					m_disasm = std::make_unique<PPUDisAsm>(CPUDisAsm_InterpreterMode);
+					m_disasm = std::make_unique<PPUDisAsm>(CPUDisAsm_InterpreterMode, vm::g_sudo_addr);
 				}
 			}
 			else if (cpu0->id_type() == 2)
@@ -473,13 +479,13 @@ void debugger_frame::OnSelectUnit()
 				if (cpu0.get() == idm::check<named_thread<spu_thread>>(cpu0->id))
 				{
 					cpu = cpu0;
-					m_disasm = std::make_unique<SPUDisAsm>(CPUDisAsm_InterpreterMode);
+					m_disasm = std::make_unique<SPUDisAsm>(CPUDisAsm_InterpreterMode, static_cast<const spu_thread*>(cpu0.get())->ls);
 				}
 			}
 		}
 	}
 
-	EnableButtons(!m_no_thread_selected);
+	EnableButtons(true);
 
 	m_debugger_list->UpdateCPUData(this->cpu, m_disasm);
 	m_breakpoint_list->UpdateCPUData(this->cpu, m_disasm);
@@ -530,38 +536,37 @@ void debugger_frame::WritePanels()
 void debugger_frame::ShowGotoAddressDialog()
 {
 	QDialog* diag = new QDialog(this);
-	diag->setWindowTitle(tr("Enter expression"));
+	diag->setWindowTitle(tr("Go To Address"));
 	diag->setModal(true);
 
 	// Panels
 	QVBoxLayout* vbox_panel(new QVBoxLayout());
-	QHBoxLayout* hbox_address_preview_panel(new QHBoxLayout());
 	QHBoxLayout* hbox_expression_input_panel = new QHBoxLayout();
 	QHBoxLayout* hbox_button_panel(new QHBoxLayout());
-
-	// Address preview
-	QLabel* address_preview_label(new QLabel(diag));
-	address_preview_label->setFont(m_mono);
 
 	// Address expression input
 	QLineEdit* expression_input(new QLineEdit(diag));
 	expression_input->setFont(m_mono);
 	expression_input->setMaxLength(18);
-	expression_input->setFixedWidth(190);
 
+	if (auto thread = cpu.lock(); !thread || thread->id_type() != 2)
+	{
+		expression_input->setValidator(new QRegExpValidator(QRegExp("^(0[xX])?0*[a-fA-F0-9]{0,8}$")));
+	}
+	else
+	{
+		expression_input->setValidator(new QRegExpValidator(QRegExp("^(0[xX])?0*[a-fA-F0-9]{0,5}$")));
+	}
+	
 	// Ok/Cancel
 	QPushButton* button_ok = new QPushButton(tr("OK"));
 	QPushButton* button_cancel = new QPushButton(tr("Cancel"));
-
-	hbox_address_preview_panel->addWidget(address_preview_label);
 
 	hbox_expression_input_panel->addWidget(expression_input);
 
 	hbox_button_panel->addWidget(button_ok);
 	hbox_button_panel->addWidget(button_cancel);
 
-	vbox_panel->addLayout(hbox_address_preview_panel);
-	vbox_panel->addSpacing(8);
 	vbox_panel->addLayout(hbox_expression_input_panel);
 	vbox_panel->addSpacing(8);
 	vbox_panel->addLayout(hbox_button_panel);
@@ -569,34 +574,13 @@ void debugger_frame::ShowGotoAddressDialog()
 	diag->setLayout(vbox_panel);
 
 	const auto cpu = this->cpu.lock();
+	const QFont font = expression_input->font();
 
-	if (cpu)
-	{
-		// -1 turns into 0
-		u32 pc = ::align<u32>(cpu->get_pc(), 4);
-		address_preview_label->setText(QString("Address: 0x%1").arg(pc, 8, 16, QChar('0')));
-		expression_input->setPlaceholderText(QString("0x%1").arg(pc, 8, 16, QChar('0')));
-	}
-	else
-	{
-		expression_input->setPlaceholderText("0x00000000");
-		address_preview_label->setText("Address: 0x00000000");
-	}
+	// -1 from get_pc() turns into 0
+	const u32 pc = cpu ? utils::align<u32>(cpu->get_pc(), 4) : 0;
+	expression_input->setPlaceholderText(QString("0x%1").arg(pc, 16, 16, QChar('0')));
+	expression_input->setFixedWidth(gui::utils::get_label_width(expression_input->placeholderText(), &font));
 
-	auto l_changeLabel = [&](const QString& text)
-	{
-		if (text.isEmpty())
-		{
-			address_preview_label->setText("Address: " + expression_input->placeholderText());
-		}
-		else
-		{
-			ulong ul_addr = EvaluateExpression(text);
-			address_preview_label->setText(QString("Address: 0x%1").arg(ul_addr, 8, 16, QChar('0')));
-		}
-	};
-
-	connect(expression_input, &QLineEdit::textChanged, l_changeLabel);
 	connect(button_ok, &QAbstractButton::clicked, diag, &QDialog::accept);
 	connect(button_cancel, &QAbstractButton::clicked, diag, &QDialog::reject);
 
@@ -604,19 +588,7 @@ void debugger_frame::ShowGotoAddressDialog()
 
 	if (diag->exec() == QDialog::Accepted)
 	{
-		// -1 turns into 0
-		u32 address = ::align<u32>(cpu ? cpu->get_pc() : 0, 4);
-
-		if (expression_input->text().isEmpty())
-		{
-			address_preview_label->setText(expression_input->placeholderText());
-		}
-		else
-		{
-			address = EvaluateExpression(expression_input->text());
-			address_preview_label->setText(expression_input->text());
-		}
-
+		const u32 address = EvaluateExpression(expression_input->text());
 		m_debugger_list->ShowAddress(address);
 	}
 
@@ -629,9 +601,12 @@ u64 debugger_frame::EvaluateExpression(const QString& expression)
 
 	if (!thread) return 0;
 
+	bool ok = false;
+
 	// Parse expression(or at least used to, was nuked to remove the need for QtJsEngine)
 	const QString fixed_expression = QRegExp("^[A-Fa-f0-9]+$").exactMatch(expression) ? "0x" + expression : expression;
-	return static_cast<ulong>(fixed_expression.toULong(nullptr, 0));
+	const u64 res = static_cast<u64>(fixed_expression.toULong(&ok, 16));
+	return ok ? res : thread->get_pc();
 }
 
 void debugger_frame::ClearBreakpoints()
@@ -696,7 +671,7 @@ void debugger_frame::EnableUpdateTimer(bool enable)
 
 void debugger_frame::EnableButtons(bool enable)
 {
-	if (m_no_thread_selected) enable = false;
+	if (cpu.expired()) enable = false;
 
 	m_go_to_addr->setEnabled(enable);
 	m_go_to_pc->setEnabled(enable);
