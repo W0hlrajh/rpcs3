@@ -13,6 +13,7 @@
 #include "Emu/Cell/PPUAnalyser.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/RawSPUThread.h"
+#include "Emu/RSX/RSXThread.h"
 #include "Emu/Cell/lv2/sys_process.h"
 #include "Emu/Cell/lv2/sys_memory.h"
 #include "Emu/Cell/lv2/sys_sync.h"
@@ -34,12 +35,9 @@
 #include "util/sysinfo.hpp"
 #include "util/yaml.hpp"
 #include "util/logs.hpp"
-
-#include "cereal/archives/binary.hpp"
-#include <cereal/types/unordered_map.hpp>
+#include "util/cereal.hpp"
 
 #include <thread>
-#include <typeinfo>
 #include <queue>
 #include <fstream>
 #include <memory>
@@ -68,7 +66,9 @@ atomic_t<u64> g_watchdog_hold_ctr{0};
 
 extern void ppu_load_exec(const ppu_exec_object&);
 extern void spu_load_exec(const spu_exec_object&);
+extern void ppu_precompile(std::vector<std::string>& dir_queue);
 extern void ppu_initialize(const ppu_module&);
+extern void ppu_finalize(const ppu_module&);
 extern void ppu_unload_prx(const lv2_prx&);
 extern std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object&, const std::string&);
 
@@ -521,14 +521,16 @@ std::string Emulator::PPUCache() const
 
 bool Emulator::BootRsxCapture(const std::string& path)
 {
-	if (!fs::is_file(path))
+	fs::file in_file(path);
+
+	if (!in_file)
+	{
 		return false;
+	}
 
-	std::fstream f(path, std::ios::in | std::ios::binary);
-
-	cereal::BinaryInputArchive archive(f);
 	std::unique_ptr<rsx::frame_capture_data> frame = std::make_unique<rsx::frame_capture_data>();
-	archive(*frame);
+	cereal_deserialize(*frame, in_file.to_string());
+	in_file.close();
 
 	if (frame->magic != rsx::FRAME_CAPTURE_MAGIC)
 	{
@@ -1114,55 +1116,10 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 					}
 				}
 
-				std::vector<std::pair<std::string, u64>> file_queue;
-				file_queue.reserve(2000);
-
-				// Initialize progress dialog
-				g_progr = "Scanning directories for SPRX libraries...";
-
-				// Find all .sprx files recursively (TODO: process .mself files)
-				for (usz i = 0; i < dir_queue.size(); i++)
-				{
-					if (Emu.IsStopped())
-					{
-						break;
-					}
-
-					sys_log.notice("Scanning directory: %s", dir_queue[i]);
-
-					for (auto&& entry : fs::dir(dir_queue[i]))
-					{
-						if (Emu.IsStopped())
-						{
-							break;
-						}
-
-						if (entry.is_directory)
-						{
-							if (entry.name != "." && entry.name != "..")
-							{
-								dir_queue.emplace_back(dir_queue[i] + entry.name + '/');
-							}
-
-							continue;
-						}
-
-						// Check .sprx filename
-						if (fmt::to_upper(entry.name).ends_with(".SPRX"))
-						{
-							// Get full path
-							file_queue.emplace_back(dir_queue[i] + entry.name, 0);
-							g_progr_ftotal++;
-						}
-					}
-				}
-
-				g_progr = "Compiling PPU modules";
-
 				if (std::string path = m_path + "/USRDIR/EBOOT.BIN"; fs::is_file(path))
 				{
 					// Compile EBOOT.BIN first
-					sys_log.notice("Trying to load EBOOT.BIN: %s", path);
+					ppu_log.notice("Trying to load EBOOT.BIN: %s", path);
 
 					fs::file src{path};
 
@@ -1193,53 +1150,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 					ensure(vm::falloc(0x10000, 0xf0000, vm::main));
 				}
 
-				atomic_t<usz> fnext = 0;
-
-				shared_mutex sprx_mtx;
-
-				named_thread_group workers("SPRX Worker ", GetMaxThreads(), [&]
-				{
-					for (usz func_i = fnext++; func_i < file_queue.size(); func_i = fnext++)
-					{
-						const auto& path = std::as_const(file_queue)[func_i].first;
-
-						sys_log.notice("Trying to load SPRX: %s", path);
-
-						// Load MSELF or SPRX
-						fs::file src{path};
-
-						if (file_queue[func_i].second == 0)
-						{
-							// Some files may fail to decrypt due to the lack of klic
-							src = decrypt_self(std::move(src));
-						}
-
-						const ppu_prx_object obj = src;
-
-						if (obj == elf_error::ok)
-						{
-							std::unique_lock lock(sprx_mtx);
-
-							if (auto prx = ppu_load_prx(obj, path))
-							{
-								lock.unlock();
-								ppu_initialize(*prx);
-								idm::remove<lv2_obj, lv2_prx>(idm::last_id());
-								lock.lock();
-								ppu_unload_prx(*prx);
-								g_progr_fdone++;
-								continue;
-							}
-						}
-
-						sys_log.error("Failed to load SPRX '%s' (%s)", path, obj.get_error());
-						g_progr_fdone++;
-						continue;
-					}
-				});
-
-				// Join every thread
-				workers.join();
+				ppu_precompile(dir_queue);
 
 				// Exit "process"
 				Emu.CallAfter([]
@@ -1501,7 +1412,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 		if (disc.empty() && !bdvd_dir.empty() && m_path != hdd0_boot && fs::is_file(hdd0_boot))
 		{
 			// Booting game update
-			sys_log.success("Updates found at /dev_hdd0/game/%s/!", m_title_id);
+			sys_log.success("Updates found at /dev_hdd0/game/%s/", m_title_id);
 			return m_path = hdd0_boot, Load(m_title_id, false, force_global_config, true);
 		}
 
@@ -1640,7 +1551,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool add_only, bool
 				sys_log.notice("Elf path: %s", argv[0]);
 			}
 
-			const auto _main = g_fxo->init<ppu_module>();
+			g_fxo->init<ppu_module>();
 
 			ppu_load_exec(ppu_exec);
 
@@ -1787,6 +1698,11 @@ bool Emulator::Pause()
 	idm::select<named_thread<ppu_thread>>(on_select);
 	idm::select<named_thread<spu_thread>>(on_select);
 
+	if (auto rsx = g_fxo->get<rsx::thread>())
+	{
+		rsx->state += cpu_flag::dbg_global_pause;
+	}
+
 	// Always Enable display sleep, not only if it was prevented.
 	enable_display_sleep();
 
@@ -1807,7 +1723,7 @@ void Emulator::Resume()
 	// Print and reset debug data collected
 	if (m_state == system_state::paused && g_cfg.core.ppu_debug)
 	{
-		PPUDisAsm dis_asm(CPUDisAsm_DumpMode, vm::g_sudo_addr);
+		PPUDisAsm dis_asm(cpu_disasm_mode::dump, vm::g_sudo_addr);
 
 		std::string dump;
 
@@ -1854,6 +1770,13 @@ void Emulator::Resume()
 
 	idm::select<named_thread<ppu_thread>>(on_select);
 	idm::select<named_thread<spu_thread>>(on_select);
+
+	if (auto rsx = g_fxo->get<rsx::thread>())
+	{
+		// TODO: notify?
+		rsx->state -= cpu_flag::dbg_global_pause;
+	}
+
 	GetCallbacks().on_resume();
 
 	if (g_cfg.misc.prevent_display_sleep)
@@ -1903,6 +1826,12 @@ void Emulator::Stop(bool restart)
 	sys_log.notice("Stopping emulator...");
 
 	GetCallbacks().on_stop();
+
+	if (auto rsx = g_fxo->get<rsx::thread>())
+	{
+		// TODO: notify?
+		rsx->state += cpu_flag::exit;
+	}
 
 	cpu_thread::stop_all();
 	g_fxo->reset();
@@ -2002,7 +1931,8 @@ std::string Emulator::GetFormattedTitle(double fps) const
 u32 Emulator::GetMaxThreads() const
 {
 	const u32 max_threads = static_cast<u32>(g_cfg.core.llvm_threads);
-	const u32 thread_count = max_threads > 0 ? std::min(max_threads, std::thread::hardware_concurrency()) : std::thread::hardware_concurrency();
+	const u32 hw_threads = utils::get_thread_count();
+	const u32 thread_count = max_threads > 0 ? std::min(max_threads, hw_threads) : hw_threads;
 	return thread_count;
 }
 

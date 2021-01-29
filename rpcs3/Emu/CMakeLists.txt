@@ -74,6 +74,11 @@ else()
 	set_source_files_properties("../util/yaml.cpp" PROPERTIES COMPILE_FLAGS -fexceptions)
 endif()
 
+if (MSVC)
+	set_source_files_properties("../util/cereal.cpp" PROPERTIES COMPILE_FLAGS /GR)
+else()
+	set_source_files_properties("../util/cereal.cpp" PROPERTIES COMPILE_FLAGS -frtti)
+endif()
 
 # Crypto
 target_sources(rpcs3_emu PRIVATE
@@ -122,9 +127,12 @@ if(USE_PULSE AND PULSE_FOUND)
 	target_link_libraries(rpcs3_emu PUBLIC 3rdparty::pulse)
 endif()
 
-if(USE_FAUDIO AND SDL2_FOUND AND NOT SDL2_VERSION VERSION_LESS 2.0.9)
-	target_sources(rpcs3_emu PRIVATE Audio/FAudio/FAudioBackend.cpp)
-	target_link_libraries(rpcs3_emu PUBLIC 3rdparty::faudio)
+if(USE_FAUDIO)
+	find_package(SDL2)
+	if(SDL2_FOUND AND NOT SDL2_VERSION VERSION_LESS 2.0.9)
+		target_sources(rpcs3_emu PRIVATE Audio/FAudio/FAudioBackend.cpp)
+		target_link_libraries(rpcs3_emu PUBLIC 3rdparty::faudio)
+	endif()
 endif()
 
 if(WIN32)
@@ -391,6 +399,7 @@ target_sources(rpcs3_emu PRIVATE
 	RSX/RSXTexture.cpp
 	RSX/RSXThread.cpp
 	RSX/rsx_utils.cpp
+	RSX/RSXDisAsm.cpp
 	RSX/Common/BufferUtils.cpp
 	RSX/Common/FragmentProgramDecompiler.cpp
 	RSX/Common/GLSLCommon.cpp
@@ -435,14 +444,17 @@ target_sources(rpcs3_emu PRIVATE
 
 if(TARGET 3rdparty_vulkan)
 	target_sources(rpcs3_emu PRIVATE
-		RSX/VK/vkutils/buffer_view.cpp
+		RSX/VK/vkutils/barriers.cpp
+		RSX/VK/vkutils/buffer_object.cpp
 		RSX/VK/vkutils/chip_class.cpp
-		RSX/VK/vkutils/command_pool.cpp
-		RSX/VK/vkutils/fence.cpp
-		RSX/VK/vkutils/mem_allocator.cpp
-		RSX/VK/vkutils/memory_block.cpp
-		RSX/VK/vkutils/physical_device.cpp
-		RSX/VK/vkutils/render_device.cpp
+		RSX/VK/vkutils/commands.cpp
+		RSX/VK/vkutils/data_heap.cpp
+		RSX/VK/vkutils/image.cpp
+		RSX/VK/vkutils/image_helpers.cpp
+		RSX/VK/vkutils/scratch.cpp
+		RSX/VK/vkutils/sync.cpp
+		RSX/VK/vkutils/memory.cpp
+		RSX/VK/vkutils/device.cpp
 		RSX/VK/vkutils/sampler.cpp
 		RSX/VK/vkutils/shared.cpp
 		RSX/VK/VKCommandStream.cpp

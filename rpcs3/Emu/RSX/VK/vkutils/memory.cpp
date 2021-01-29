@@ -1,11 +1,8 @@
-#include "mem_allocator.h"
-#include "util/logs.hpp"
-#include "../VKHelpers.h"
+#include "device.h"
+#include "memory.h"
 
 namespace vk
 {
-	extern const render_device* g_current_renderer;
-
 	mem_allocator_vma::mem_allocator_vma(VkDevice dev, VkPhysicalDevice pdev) : mem_allocator_base(dev, pdev)
 	{
 		// Initialize stats pool
@@ -66,12 +63,12 @@ namespace vk
 
 	void* mem_allocator_vma::map(mem_handle_t mem_handle, u64 offset, u64 /*size*/)
 	{
-		void *data = nullptr;
+		void* data = nullptr;
 
 		CHECK_RESULT(vmaMapMemory(m_allocator, static_cast<VmaAllocation>(mem_handle), &data));
 
 		// Add offset
-		data = static_cast<u8 *>(data) + offset;
+		data = static_cast<u8*>(data) + offset;
 		return data;
 	}
 
@@ -119,9 +116,9 @@ namespace vk
 	{
 		VkDeviceMemory memory;
 		VkMemoryAllocateInfo info = {};
-		info.sType                = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		info.allocationSize       = block_sz;
-		info.memoryTypeIndex      = memory_type_index;
+		info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		info.allocationSize = block_sz;
+		info.memoryTypeIndex = memory_type_index;
 
 		if (VkResult result = vkAllocateMemory(m_device, &info, nullptr, &memory); result != VK_SUCCESS)
 		{
@@ -180,7 +177,84 @@ namespace vk
 
 	mem_allocator_base* get_current_mem_allocator()
 	{
-		ensure(g_current_renderer);
-		return g_current_renderer->get_allocator();
+		return g_render_device->get_allocator();
+	}
+
+	memory_block::memory_block(VkDevice dev, u64 block_sz, u64 alignment, u32 memory_type_index)
+		: m_device(dev)
+	{
+		m_mem_allocator = get_current_mem_allocator();
+		m_mem_handle    = m_mem_allocator->alloc(block_sz, alignment, memory_type_index);
+	}
+
+	memory_block::~memory_block()
+	{
+		if (m_mem_allocator)
+		{
+			m_mem_allocator->free(m_mem_handle);
+		}
+	}
+
+	memory_block_host::memory_block_host(VkDevice dev, void* host_pointer, u64 size, u32 memory_type_index) :
+		m_device(dev), m_mem_handle(VK_NULL_HANDLE), m_host_pointer(host_pointer)
+	{
+		VkMemoryAllocateInfo alloc_info{};
+		VkImportMemoryHostPointerInfoEXT import_info{};
+
+		alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		alloc_info.memoryTypeIndex = memory_type_index;
+		alloc_info.allocationSize = size;
+		alloc_info.pNext = &import_info;
+
+		import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+		import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+		import_info.pHostPointer = host_pointer;
+
+		CHECK_RESULT(vkAllocateMemory(m_device, &alloc_info, nullptr, &m_mem_handle));
+	}
+
+	memory_block_host::~memory_block_host()
+	{
+		vkFreeMemory(m_device, m_mem_handle, nullptr);
+	}
+
+	VkDeviceMemory memory_block_host::get_vk_device_memory()
+	{
+		return m_mem_handle;
+	}
+
+	u64 memory_block_host::get_vk_device_memory_offset()
+	{
+		return 0ull;
+	}
+
+	void* memory_block_host::map(u64 offset, u64 size)
+	{
+		return reinterpret_cast<char*>(m_host_pointer) + offset;
+	}
+
+	void memory_block_host::unmap()
+	{
+		// NOP
+	}
+
+	VkDeviceMemory memory_block::get_vk_device_memory()
+	{
+		return m_mem_allocator->get_vk_device_memory(m_mem_handle);
+	}
+
+	u64 memory_block::get_vk_device_memory_offset()
+	{
+		return m_mem_allocator->get_vk_device_memory_offset(m_mem_handle);
+	}
+
+	void* memory_block::map(u64 offset, u64 size)
+	{
+		return m_mem_allocator->map(m_mem_handle, offset, size);
+	}
+
+	void memory_block::unmap()
+	{
+		m_mem_allocator->unmap(m_mem_handle);
 	}
 }

@@ -5,13 +5,14 @@
 #include "Utilities/Thread.h"
 
 #if defined(_WIN32) || defined(HAVE_VULKAN)
-#include "Emu/RSX/VK/VKHelpers.h"
+#include "Emu/RSX/VK/vkutils/instance.hpp"
 #endif
 
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <util/logs.hpp>
 
 LOG_CHANNEL(cfg_log, "CFG");
 
@@ -37,13 +38,13 @@ render_creator::render_creator(QObject *parent) : QObject(parent)
 
 	std::thread enum_thread = std::thread([&]
 	{
-		thread_ctrl::set_native_priority(-1);
+		thread_ctrl::scoped_priority low_prio(-1);
 
-		vk::context device_enum_context;
-		if (device_enum_context.createInstance("RPCS3", true))
+		vk::instance device_enum_context;
+		if (device_enum_context.create("RPCS3", true))
 		{
-			device_enum_context.makeCurrentInstance();
-			std::vector<vk::physical_device>& gpus = device_enum_context.enumerateDevices();
+			device_enum_context.bind();
+			std::vector<vk::physical_device>& gpus = device_enum_context.enumerate_devices();
 
 			if (!gpus.empty())
 			{

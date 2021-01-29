@@ -25,7 +25,7 @@ namespace rsx
 		rsx->recover_fifo();
 	}
 
-	void trace_method(thread* rsx, u32 _reg, u32 arg)
+	static void trace_method(thread* rsx, u32 _reg, u32 arg)
 	{
 		// For unknown yet valid methods
 		rsx_log.trace("RSX method 0x%x (arg=0x%x)", _reg << 2, arg);
@@ -77,25 +77,20 @@ namespace rsx
 			u64 start = get_system_time();
 			while (sema != arg)
 			{
-				if (Emu.IsStopped())
-					return;
-
-				// Wait for external pause events
-				if (rsx->external_interrupt_lock)
+				if (rsx->is_stopped())
 				{
-					rsx->wait_pause();
-					continue;
+					return;
 				}
 
 				if (const auto tdr = static_cast<u64>(g_cfg.video.driver_recovery_timeout))
 				{
-					if (Emu.IsPaused())
+					if (rsx->is_paused())
 					{
 						const u64 start0 = get_system_time();
 
-						while (Emu.IsPaused())
+						while (rsx->is_paused())
 						{
-							std::this_thread::sleep_for(1ms);
+							rsx->cpu_wait();
 						}
 
 						// Reset
@@ -112,8 +107,7 @@ namespace rsx
 					}
 				}
 
-				rsx->on_semaphore_acquire_wait();
-				std::this_thread::yield();
+				rsx->cpu_wait();
 			}
 
 			rsx->fifo_wake_delay();

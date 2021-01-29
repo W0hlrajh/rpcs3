@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #include "util/vm.hpp"
+#include "util/sysinfo.hpp"
 
 namespace rsx
 {
@@ -628,7 +629,7 @@ namespace rsx
 
 			// Preload everything needed to compile the shaders
 			unpacked_type unpacked;
-			uint nb_workers = g_cfg.video.renderer == video_renderer::vulkan ? std::thread::hardware_concurrency() : 1;
+			uint nb_workers = g_cfg.video.renderer == video_renderer::vulkan ? utils::get_thread_count() : 1;
 
 			load_shaders(nb_workers, unpacked, directory_path, entries, entry_count, dlg);
 
@@ -842,7 +843,7 @@ namespace rsx
 
 			storage_type* find_vertex_range(uptr local_addr, upload_format fmt, u32 data_length) override
 			{
-				const auto data_end = local_addr + data_length;
+				//const auto data_end = local_addr + data_length;
 
 				for (auto &v : vertex_ranges[local_addr])
 				{

@@ -1,64 +1,21 @@
 #include "stdafx.h"
 #include "VKHelpers.h"
-#include "../GCM.h"
-#include "../rsx_utils.h"
 #include "VKFormats.h"
 #include "VKCompute.h"
+#include "VKDMA.h"
 #include "VKRenderPass.h"
 #include "VKRenderTargets.h"
+
+#include "vkutils/data_heap.h"
+#include "vkutils/image_helpers.h"
+
+#include "../GCM.h"
+#include "../rsx_utils.h"
 
 #include "util/asm.hpp"
 
 namespace vk
 {
-	VkComponentMapping default_component_map()
-	{
-		VkComponentMapping result = {};
-		result.a = VK_COMPONENT_SWIZZLE_A;
-		result.r = VK_COMPONENT_SWIZZLE_R;
-		result.g = VK_COMPONENT_SWIZZLE_G;
-		result.b = VK_COMPONENT_SWIZZLE_B;
-
-		return result;
-	}
-
-	VkImageSubresource default_image_subresource()
-	{
-		VkImageSubresource subres = {};
-		subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		subres.mipLevel = 0;
-		subres.arrayLayer = 0;
-
-		return subres;
-	}
-
-	VkImageSubresourceRange get_image_subresource_range(u32 base_layer, u32 base_mip, u32 layer_count, u32 level_count, VkImageAspectFlags aspect)
-	{
-		VkImageSubresourceRange subres = {};
-		subres.aspectMask = aspect;
-		subres.baseArrayLayer = base_layer;
-		subres.baseMipLevel = base_mip;
-		subres.layerCount = layer_count;
-		subres.levelCount = level_count;
-
-		return subres;
-	}
-
-	VkImageAspectFlags get_aspect_flags(VkFormat format)
-	{
-		switch (format)
-		{
-		default:
-			return VK_IMAGE_ASPECT_COLOR_BIT;
-		case VK_FORMAT_D16_UNORM:
-		case VK_FORMAT_D32_SFLOAT:
-			return VK_IMAGE_ASPECT_DEPTH_BIT;
-		case VK_FORMAT_D24_UNORM_S8_UINT:
-		case VK_FORMAT_D32_SFLOAT_S8_UINT:
-			return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-		}
-	}
-
 	void copy_image_to_buffer(VkCommandBuffer cmd, const vk::image* src, const vk::buffer* dst, const VkBufferImageCopy& region, bool swap_bytes)
 	{
 		// Always validate
@@ -844,7 +801,7 @@ namespace vk
 		ensure(dst_offset <= scratch_buf->size());
 	}
 
-	void copy_mipmaped_image_using_buffer(VkCommandBuffer cmd, vk::image* dst_image,
+	void copy_mipmaped_image_using_buffer(const vk::command_buffer& cmd, vk::image* dst_image,
 		const std::vector<rsx::subresource_layout>& subresource_layout, int format, bool is_swizzled, u16 mipmap_count,
 		VkImageAspectFlags flags, vk::data_heap &upload_heap, u32 heap_align)
 	{
@@ -852,7 +809,7 @@ namespace vk
 		u32 block_in_pixel = rsx::get_format_block_size_in_texel(format);
 		u8  block_size_in_bytes = rsx::get_format_block_size_in_bytes(format);
 
-		rsx::texture_uploader_capabilities caps{ true, false, true, heap_align };
+		rsx::texture_uploader_capabilities caps{ .alignment = heap_align };
 		rsx::texture_memory_info opt{};
 		bool check_caps = true;
 
@@ -860,8 +817,12 @@ namespace vk
 		u32 scratch_offset = 0;
 		u32 row_pitch, image_linear_size;
 
+		vk::buffer* upload_buffer = nullptr;
+		usz offset_in_upload_buffer = 0;
+
 		std::vector<VkBufferImageCopy> copy_regions;
 		std::vector<VkBufferCopy> buffer_copies;
+		std::vector<std::pair<VkBuffer, u32>> upload_commands;
 		copy_regions.reserve(subresource_layout.size());
 
 		if (vk::is_renderpass_open(cmd))
@@ -894,14 +855,16 @@ namespace vk
 			image_linear_size = row_pitch * layout.height_in_block * layout.depth;
 
 			// Map with extra padding bytes in case of realignment
-			usz offset_in_buffer = upload_heap.alloc<512>(image_linear_size + 8);
-			void* mapped_buffer = upload_heap.map(offset_in_buffer, image_linear_size + 8);
+			offset_in_upload_buffer = upload_heap.alloc<512>(image_linear_size + 8);
+			void* mapped_buffer = upload_heap.map(offset_in_upload_buffer, image_linear_size + 8);
 
 			// Only do GPU-side conversion if occupancy is good
 			if (check_caps)
 			{
 				caps.supports_byteswap = (image_linear_size >= 1024);
 				caps.supports_hw_deswizzle = caps.supports_byteswap;
+				caps.supports_zero_copy = caps.supports_byteswap;
+				caps.supports_vtc_decoding = false;
 				check_caps = false;
 			}
 
@@ -911,7 +874,7 @@ namespace vk
 
 			copy_regions.push_back({});
 			auto& copy_info = copy_regions.back();
-			copy_info.bufferOffset = offset_in_buffer;
+			copy_info.bufferOffset = offset_in_upload_buffer;
 			copy_info.imageExtent.height = layout.height_in_texel;
 			copy_info.imageExtent.width = layout.width_in_texel;
 			copy_info.imageExtent.depth = layout.depth;
@@ -920,6 +883,36 @@ namespace vk
 			copy_info.imageSubresource.baseArrayLayer = layout.layer;
 			copy_info.imageSubresource.mipLevel = layout.level;
 			copy_info.bufferRowLength = std::max<u32>(block_in_pixel * row_pitch / block_size_in_bytes, layout.width_in_texel);
+
+			upload_buffer = upload_heap.heap.get();
+
+			if (opt.require_upload)
+			{
+				ensure(!opt.deferred_cmds.empty());
+
+				auto base_addr = static_cast<const char*>(opt.deferred_cmds.front().src);
+				auto end_addr = static_cast<const char*>(opt.deferred_cmds.back().src) + opt.deferred_cmds.back().length;
+				auto data_length = end_addr - base_addr;
+				u64 src_address = 0;
+
+				if (uptr(base_addr) > uptr(vm::g_sudo_addr))
+				{
+					src_address = uptr(base_addr) - uptr(vm::g_sudo_addr);
+				}
+				else
+				{
+					src_address = uptr(base_addr) - uptr(vm::g_base_addr);
+				}
+
+				auto dma_mapping = vk::map_dma(cmd, static_cast<u32>(src_address), static_cast<u32>(data_length));
+
+				ensure(dma_mapping.second->size() >= (dma_mapping.first + data_length));
+				vk::load_dma(::narrow<u32>(src_address), data_length);
+
+				upload_buffer = dma_mapping.second;
+				offset_in_upload_buffer = dma_mapping.first;
+				copy_info.bufferOffset = offset_in_upload_buffer;
+			}
 
 			if (opt.require_swap || opt.require_deswizzle || requires_depth_processing)
 			{
@@ -936,11 +929,25 @@ namespace vk
 				}
 
 				// Copy from upload heap to scratch mem
-				buffer_copies.push_back({});
-				auto& copy = buffer_copies.back();
-				copy.srcOffset = offset_in_buffer;
-				copy.dstOffset = scratch_offset;
-				copy.size = image_linear_size;
+				if (opt.require_upload)
+				{
+					for (const auto& copy_cmd : opt.deferred_cmds)
+					{
+						buffer_copies.push_back({});
+						auto& copy = buffer_copies.back();
+						copy.srcOffset = uptr(copy_cmd.dst) + offset_in_upload_buffer;
+						copy.dstOffset = scratch_offset;
+						copy.size = copy_cmd.length;
+					}
+				}
+				else
+				{
+					buffer_copies.push_back({});
+					auto& copy = buffer_copies.back();
+					copy.srcOffset = offset_in_upload_buffer;
+					copy.dstOffset = scratch_offset;
+					copy.size = image_linear_size;
+				}
 
 				// Point data source to scratch mem
 				copy_info.bufferOffset = scratch_offset;
@@ -948,12 +955,41 @@ namespace vk
 				scratch_offset += image_linear_size;
 				ensure((scratch_offset + image_linear_size) <= scratch_buf->size()); // "Out of scratch memory"
 			}
+
+			if (opt.require_upload)
+			{
+				if (upload_commands.empty() || upload_buffer->value != upload_commands.back().first)
+				{
+					upload_commands.emplace_back(upload_buffer->value, 1);
+				}
+				else
+				{
+					upload_commands.back().second++;
+				}
+
+				copy_info.bufferRowLength = std::max<u32>(block_in_pixel * layout.pitch_in_block, layout.width_in_texel);
+			}
 		}
+
+		ensure(upload_buffer);
 
 		if (opt.require_swap || opt.require_deswizzle || requires_depth_processing)
 		{
 			ensure(scratch_buf);
-			vkCmdCopyBuffer(cmd, upload_heap.heap->value, scratch_buf->value, static_cast<u32>(buffer_copies.size()), buffer_copies.data());
+
+			if (upload_commands.size() > 1)
+			{
+				auto range_ptr = buffer_copies.data();
+				for (const auto& op : upload_commands)
+				{
+					vkCmdCopyBuffer(cmd, op.first, scratch_buf->value, op.second, range_ptr);
+					range_ptr += op.second;
+				}
+			}
+			else
+			{
+				vkCmdCopyBuffer(cmd, upload_buffer->value, scratch_buf->value, static_cast<u32>(buffer_copies.size()), buffer_copies.data());
+			}
 
 			insert_buffer_memory_barrier(cmd, scratch_buf->value, 0, scratch_offset, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -999,35 +1035,19 @@ namespace vk
 
 			vkCmdCopyBufferToImage(cmd, scratch_buf->value, dst_image->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<u32>(copy_regions.size()), copy_regions.data());
 		}
-		else
+		else if (upload_commands.size() > 1)
 		{
-			vkCmdCopyBufferToImage(cmd, upload_heap.heap->value, dst_image->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<u32>(copy_regions.size()), copy_regions.data());
-		}
-	}
-
-	VkComponentMapping apply_swizzle_remap(const std::array<VkComponentSwizzle, 4>& base_remap, const std::pair<std::array<u8, 4>, std::array<u8, 4>>& remap_vector)
-	{
-		VkComponentSwizzle final_mapping[4] = {};
-
-		for (u8 channel = 0; channel < 4; ++channel)
-		{
-			switch (remap_vector.second[channel])
+			auto region_ptr = copy_regions.data();
+			for (const auto& op : upload_commands)
 			{
-			case CELL_GCM_TEXTURE_REMAP_ONE:
-				final_mapping[channel] = VK_COMPONENT_SWIZZLE_ONE;
-				break;
-			case CELL_GCM_TEXTURE_REMAP_ZERO:
-				final_mapping[channel] = VK_COMPONENT_SWIZZLE_ZERO;
-				break;
-			case CELL_GCM_TEXTURE_REMAP_REMAP:
-				final_mapping[channel] = base_remap[remap_vector.first[channel]];
-				break;
-			default:
-				rsx_log.error("Unknown remap lookup value %d", remap_vector.second[channel]);
+				vkCmdCopyBufferToImage(cmd, op.first, dst_image->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, op.second, region_ptr);
+				region_ptr += op.second;
 			}
 		}
-
-		return{ final_mapping[1], final_mapping[2], final_mapping[3], final_mapping[0] };
+		else
+		{
+			vkCmdCopyBufferToImage(cmd, upload_buffer->value, dst_image->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<u32>(copy_regions.size()), copy_regions.data());
+		}
 	}
 
 	void blitter::scale_image(vk::command_buffer& cmd, vk::image* src, vk::image* dst, areai src_area, areai dst_area, bool interpolate, const rsx::typeless_xfer& xfer_info)
