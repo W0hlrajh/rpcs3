@@ -33,6 +33,8 @@
 
 constexpr auto qstr = QString::fromStdString;
 
+constexpr auto s_pause_flags = cpu_flag::dbg_pause + cpu_flag::dbg_global_pause;
+
 debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *parent)
 	: custom_dock_widget(tr("Debugger"), parent), xgui_settings(settings)
 {
@@ -140,11 +142,24 @@ debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *
 	{
 		if (const auto cpu = get_cpu())
 		{
-			// Alter dbg_pause bit state (disable->enable, enable->disable)
-			const auto old = cpu->state.xor_fetch(cpu_flag::dbg_pause);
+			// If paused, unpause.
+			// If not paused, add dbg_pause.
+			const auto old = cpu->state.atomic_op([](bs_t<cpu_flag>& state)
+			{
+				if (state & s_pause_flags)
+				{
+					state -= s_pause_flags;
+				}
+				else
+				{
+					state += cpu_flag::dbg_pause;
+				}
+
+				return state;
+			});
 
 			// Notify only if no pause flags are set after this change
-			if (!(old & (cpu_flag::dbg_pause + cpu_flag::dbg_global_pause)))
+			if (!(old & s_pause_flags))
 			{
 				cpu->notify();
 			}
@@ -253,6 +268,10 @@ void debugger_frame::keyPressEvent(QKeyEvent* event)
 			"\nKey F10: Perform single-stepping on instructions."
 			"\nKey F11: Perform step-over on instructions. (skip function calls)"
 			"\nKey F1: Show this help dialog."
+			"\nKey Up: Scroll one instruction upwards. (address is decremented)"
+			"\nKey Down: Scroll one instruction downwards. (address is incremented)"
+			"\nKey Page-Up: Scroll upwards with steps count equal to the viewed instruction count."
+			"\nKey Page-Down: Scroll downwards with steps count equal to the viewed instruction count."
 			"\nDouble-click: Set breakpoints."));
 
 		gui::utils::set_font_size(*l, 9);
@@ -441,7 +460,7 @@ void debugger_frame::UpdateUI()
 			m_last_pc = cia;
 			DoUpdate();
 
-			if (cpu->state & cpu_flag::dbg_pause)
+			if (cpu->state & s_pause_flags)
 			{
 				m_btn_run->setText(RunString);
 				m_btn_step->setEnabled(true);
@@ -725,13 +744,7 @@ void debugger_frame::DoStep(bool stepOver)
 	{
 		bool should_step_over = stepOver && cpu->id_type() == 1;
 
-		if (+cpu_flag::dbg_pause & +cpu->state.fetch_op([&](bs_t<cpu_flag>& state)
-		{
-			if (!should_step_over)
-				state += cpu_flag::dbg_step;
-
-			state -= cpu_flag::dbg_pause;
-		}))
+		if (cpu->state & s_pause_flags)
 		{
 			if (should_step_over)
 			{
@@ -750,6 +763,13 @@ void debugger_frame::DoStep(bool stepOver)
 
 				m_last_step_over_breakpoint = next_instruction_pc;
 			}
+
+			cpu->state.atomic_op([&](bs_t<cpu_flag>& state)
+			{
+				state -= s_pause_flags;
+
+				if (!should_step_over) state += cpu_flag::dbg_step;
+			});
 
 			cpu->notify();
 		}
