@@ -244,7 +244,7 @@ static void ppu_initialize_modules(ppu_linkage_info* link)
 	};
 
 	// Initialize double-purpose fake OPD array for HLE functions
-	const auto& hle_funcs = ppu_function_manager::get();
+	const auto& hle_funcs = ppu_function_manager::get(g_cfg.core.ppu_decoder == ppu_decoder_type::llvm);
 
 	// Allocate memory for the array (must be called after fixed allocations)
 	ppu_function_manager::addr = vm::alloc(::size32(hle_funcs) * 8, vm::main);
@@ -467,7 +467,7 @@ static auto ppu_load_exports(ppu_linkage_info* link, u32 exports_start, u32 expo
 
 				if (i < lib.num_func)
 				{
-					ppu_loader.notice("** Special: [%s] at 0x%x", ppu_get_function_name({}, nid), addr);
+					ppu_loader.notice("** Special: [%s] at 0x%x [0x%x, 0x%x]", ppu_get_function_name({}, nid), addr, vm::_ref<u32>(addr), vm::_ref<u32>(addr + 4));
 				}
 				else
 				{
@@ -1058,7 +1058,7 @@ std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, const std::stri
 		prx->specials = ppu_load_exports(link, lib_info->exports_start, lib_info->exports_end);
 		prx->imports = ppu_load_imports(prx->relocs, link, lib_info->imports_start, lib_info->imports_end);
 		std::stable_sort(prx->relocs.begin(), prx->relocs.end());
-		prx->analyse(lib_info->toc, 0);
+		prx->analyse(lib_info->toc, 0, std::min<u32>(lib_info.addr(), prx->segs[0].addr + prx->segs[0].size));
 	}
 	else
 	{
