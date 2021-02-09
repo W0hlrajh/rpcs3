@@ -717,7 +717,7 @@ static void ppu_check_patch_spu_images(const ppu_segment& seg)
 		std::string name;
 		std::string dump;
 
-		usz applied = 0;
+		std::basic_string<u32> applied;
 
 		// Executable hash
 		sha1_context sha2;
@@ -782,7 +782,7 @@ static void ppu_check_patch_spu_images(const ppu_segment& seg)
 			}
 		}
 
-		ppu_loader.success("SPU executable hash: %s (<- %u)%s", hash, applied, dump);
+		ppu_loader.success("SPU executable hash: %s (<- %u)%s", hash, applied.size(), dump);
 	}
 }
 
@@ -868,7 +868,6 @@ std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, const std::stri
 				if (prog.p_flags & 0x1)
 				{
 					ppu_register_range(addr, mem_size);
-					end = std::max<u32>(end, addr + mem_size);
 				}
 
 				_seg.addr = addr;
@@ -883,11 +882,6 @@ std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, const std::stri
 
 		default: ppu_loader.error("Unknown segment type! 0x%08x", p_type);
 		}
-	}
-
-	if (!elf.shdrs.empty())
-	{
-		end = 0;
 	}
 
 	for (const auto& s : elf.shdrs)
@@ -915,7 +909,7 @@ std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, const std::stri
 					_sec.filesz = 0;
 					prx->secs.emplace_back(_sec);
 
-					if (_sec.flags & 0x4)
+					if (_sec.flags & 0x4 && i == 0)
 					{
 						end = std::max<u32>(end, _sec.addr + _sec.size);
 					}
@@ -1107,21 +1101,15 @@ std::shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, const std::stri
 		applied += g_fxo->get<patch_engine>()->apply(Emu.GetTitleID() + '-' + hash, vm::g_base_addr);
 	}
 
-	if (applied)
-	{
-		// TODO (invalidate constraints if patches were applied)
-		end = 0;
-	}
-
 	// Embedded SPU elf patching
 	for (const auto& seg : prx->segs)
 	{
 		ppu_check_patch_spu_images(seg);
 	}
 
-	prx->analyse(toc, 0, end);
+	prx->analyse(toc, 0, end, applied);
 
-	ppu_loader.success("PRX library hash: %s (<- %u)", hash, applied);
+	ppu_loader.success("PRX library hash: %s (<- %u)", hash, applied.size());
 
 	try_spawn_ppu_if_exclusive_program(*prx);
 
@@ -1271,17 +1259,11 @@ bool ppu_load_exec(const ppu_exec_object& elf)
 			if (prog.p_flags & 0x1)
 			{
 				ppu_register_range(addr, size);
-				end = std::max<u32>(end, addr + size);
 			}
 
 			// Store only LOAD segments (TODO)
 			_main->segs.emplace_back(_seg);
 		}
-	}
-
-	if (!elf.shdrs.empty())
-	{
-		end = 0;
 	}
 
 	// Load section list, used by the analyser
@@ -1303,7 +1285,7 @@ bool ppu_load_exec(const ppu_exec_object& elf)
 		{
 			_main->secs.emplace_back(_sec);
 
-			if (_sec.flags & 0x4)
+			if (_sec.flags & 0x4 && addr >= _main->segs[0].addr && addr + size <= _main->segs[0].addr + _main->segs[0].size)
 			{
 				end = std::max<u32>(end, addr + size);
 			}
@@ -1330,7 +1312,7 @@ bool ppu_load_exec(const ppu_exec_object& elf)
 		applied += g_fxo->get<patch_engine>()->apply(Emu.GetTitleID() + '-' + hash, vm::g_base_addr);
 	}
 
-	ppu_loader.success("PPU executable hash: %s (<- %u)", hash, applied);
+	ppu_loader.success("PPU executable hash: %s (<- %u)", hash, applied.size());
 
 	// Initialize HLE modules
 	ppu_initialize_modules(link);
@@ -1570,14 +1552,8 @@ bool ppu_load_exec(const ppu_exec_object& elf)
 	_main->name.clear();
 	_main->path = vfs::get(Emu.argv[0]);
 
-	if (applied)
-	{
-		// TODO (invalidate constraints if patches were applied)
-		end = 0;
-	}
-
 	// Analyse executable (TODO)
-	_main->analyse(0, static_cast<u32>(elf.header.e_entry), end);
+	_main->analyse(0, static_cast<u32>(elf.header.e_entry), end, applied);
 
 	// Validate analyser results (not required)
 	_main->validate(0);
@@ -1794,17 +1770,11 @@ std::pair<std::shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_ex
 			if (prog.p_flags & 0x1)
 			{
 				ppu_register_range(addr, size);
-				end = std::max<u32>(end, addr + size);
 			}
 
 			// Store only LOAD segments (TODO)
 			ovlm->segs.emplace_back(_seg);
 		}
-	}
-
-	if (elf.shdrs.size())
-	{
-		end = 0;
 	}
 
 	// Load section list, used by the analyser
@@ -1826,7 +1796,7 @@ std::pair<std::shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_ex
 		{
 			ovlm->secs.emplace_back(_sec);
 
-			if (_sec.flags & 0x4)
+			if (_sec.flags & 0x4 && addr >= ovlm->segs[0].addr && addr + size <= ovlm->segs[0].addr + ovlm->segs[0].size)
 			{
 				end = std::max<u32>(end, addr + size);
 			}
@@ -1859,7 +1829,7 @@ std::pair<std::shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_ex
 		ppu_check_patch_spu_images(seg);
 	}
 
-	ppu_loader.success("OVL executable hash: %s (<- %u)", hash, applied);
+	ppu_loader.success("OVL executable hash: %s (<- %u)", hash, applied.size());
 
 	// Load other programs
 	for (auto& prog : elf.progs)
@@ -1946,14 +1916,8 @@ std::pair<std::shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_ex
 
 	ovlm->entry = static_cast<u32>(elf.header.e_entry);
 
-	if (applied)
-	{
-		// TODO (invalidate constraints if patches were applied)
-		end = 0;
-	}
-
 	// Analyse executable (TODO)
-	ovlm->analyse(0, ovlm->entry, end);
+	ovlm->analyse(0, ovlm->entry, end, applied);
 
 	// Validate analyser results (not required)
 	ovlm->validate(0);

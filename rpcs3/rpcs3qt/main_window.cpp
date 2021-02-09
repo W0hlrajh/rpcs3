@@ -35,6 +35,7 @@
 #include <QMimeData>
 #include <QMessageBox>
 #include <QFileDialog>
+#include <QFontDatabase>
 
 #include "rpcs3_version.h"
 #include "Emu/System.h"
@@ -99,7 +100,7 @@ bool main_window::Init()
 	setMinimumSize(350, minimumSizeHint().height());    // seems fine on win 10
 	setWindowTitle(QString::fromStdString("RPCS3 " + rpcs3::get_version().to_string()));
 
-	Q_EMIT RequestGlobalStylesheetChange(m_gui_settings->GetCurrentStylesheetPath());
+	Q_EMIT RequestGlobalStylesheetChange();
 	ConfigureGuiFromSettings(true);
 
 	if (const std::string_view branch_name = rpcs3::get_full_branch(); branch_name != "RPCS3/rpcs3/master" && branch_name != "local_build")
@@ -855,6 +856,9 @@ void main_window::HandlePupInstallation(QString file_path)
 		return;
 	}
 
+	// Remove possibly PS3 fonts from database
+	QFontDatabase::removeAllApplicationFonts();
+
 	progress_dialog pdlg(tr("RPCS3 Firmware Installer"), tr("Installing firmware version %1\nPlease wait...").arg(qstr(version_string)), tr("Cancel"), 0, static_cast<int>(update_filenames.size()), false, this);
 	pdlg.show();
 
@@ -918,6 +922,9 @@ void main_window::HandlePupInstallation(QString file_path)
 			std::this_thread::sleep_for(100ms);
 		}
 	}
+
+	// Update with newly installed PS3 fonts
+	Q_EMIT RequestGlobalStylesheetChange();
 
 	if (progress > 0)
 	{

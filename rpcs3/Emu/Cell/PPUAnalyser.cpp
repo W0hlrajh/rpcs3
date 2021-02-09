@@ -530,15 +530,13 @@ namespace ppu_patterns
 	};
 }
 
-void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
+void ppu_module::analyse(u32 lib_toc, u32 entry, const u32 sec_end, const std::basic_string<u32>& applied)
 {
 	// Assume first segment is executable
 	const u32 start = segs[0].addr;
 
-	if (!end)
-	{
-		end = segs[0].addr + segs[0].size;
-	}
+	// End of executable segment (may change)
+	u32 end = sec_end ? sec_end : segs[0].addr + segs[0].size;
 
 	// Known TOCs (usually only 1)
 	std::unordered_set<u32> TOCs;
@@ -1530,6 +1528,12 @@ void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
 	ppu_log.notice("Function analysis: %zu functions (%zu enqueued)", fmap.size(), func_queue.size());
 
 	// Decompose functions to basic blocks
+	if (!entry && !sec_end)
+	{
+		// Regenerate end from blocks
+		end = 0;
+	}
+
 	for (auto&& [_, func] : as_rvalue(std::move(fmap)))
 	{
 		if (func.attr & ppu_attr::no_size && entry)
@@ -1571,10 +1575,10 @@ void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
 			block.toc  = func.toc;
 			ppu_log.trace("Block __0x%x added (func=0x%x, size=0x%x, toc=0x%x)", block.addr, _, block.size, block.toc);
 
-			if (!entry)
+			if (!entry && !sec_end)
 			{
 				// Workaround for SPRX: update end to the last found function
-				end = block.addr + block.size;
+				end = std::max<u32>(end, block.addr + block.size);
 			}
 		}
 	}
@@ -1634,6 +1638,16 @@ void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
 		block_queue.emplace_back(exp, lim);
 	}
 
+	// Add entries from patches (on per-instruction basis)
+	for (u32 addr : applied)
+	{
+		if (addr % 4 == 0 && addr >= start && addr < segs[0].addr + segs[0].size && !block_set.count(addr))
+		{
+			block_queue.emplace_back(addr, addr + 4);
+			block_set.emplace(addr);
+		}
+	}
+
 	// block_queue may grow
 	for (usz i = 0; i < block_queue.size(); i++)
 	{
@@ -1657,6 +1671,7 @@ void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
 			u32 i_pos = exp;
 
 			bool is_good = true;
+			bool is_fallback = true;
 
 			for (; i_pos < lim; i_pos += 4)
 			{
@@ -1679,6 +1694,11 @@ void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
 				case ppu_itype::B:
 				case ppu_itype::BC:
 				{
+					if (type == ppu_itype::B)
+					{
+						is_fallback = false;
+					}
+
 					if (type == ppu_itype::B || type == ppu_itype::BC)
 					{
 						if (entry == 0 && ppu_opcode_t{opc}.aa)
@@ -1690,7 +1710,7 @@ void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
 
 						const u32 target = (opc & 2 ? 0 : i_pos) + (type == ppu_itype::B ? +ppu_opcode_t{opc}.bt24 : +ppu_opcode_t{opc}.bt14);
 
-						if (target < start || target >= end)
+						if (target < segs[0].addr || target >= segs[0].addr + segs[0].size)
 						{
 							// Sanity check
 							is_good = false;
@@ -1753,6 +1773,18 @@ void ppu_module::analyse(u32 lib_toc, u32 entry, u32 end)
 			if (i_pos < lim)
 			{
 				i_pos += 4;
+			}
+			else if (is_good && is_fallback && lim < end)
+			{
+				// Register fallback target
+				const auto found = fmap.find(lim);
+
+				if (found == fmap.cend() && block_set.count(lim) == 0)
+				{
+					ppu_log.trace("Block target found: 0x%x (i_pos=0x%x)", lim, i_pos);
+					block_queue.emplace_back(lim, 0);
+					block_set.emplace(lim);
+				}
 			}
 
 			if (is_good)
